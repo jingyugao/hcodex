@@ -5,7 +5,7 @@
 ## 分层
 
 ```
-多人聊天层（上，计划中）  参与者、谁能发言、发起人 turn/start / 其他人排队、按输入记录作者
+多人聊天层（上，chat/）    对话、参与者、发送规则（发起人 turn/start、其他人排队）、按输入记录作者、路由
       │ 只依赖下层和上游已有的 API
 高可用层（下，ha/）        PG thread store、跨 pod 交接、thread 绑定远程沙箱
       │ 通过 codex fork 的注册口接入
@@ -20,6 +20,7 @@ codex fork                 jingyugao/codex：per-turn env（fork.env.*）+ 注�
 | `ha/pg` | `hcodex-pg` | PG thread store（实现上游 `ThreadStore`）、交接记录、沙箱绑定记录 |
 | `ha/ext` | `hcodex-ha` | 跨 pod 交接、沙箱绑定（codex 的 thread extension） |
 | `server` | `hcodex-server` | 二进制 `codex-app-server`：上游入口原样复制，启动前注册高可用层（`server/src/ha.rs`） |
+| `chat` | `@hcodex/chat`（TypeScript） | 对话服务：对话 API（PG）+ 原生协议网关，见下文"多人聊天层" |
 
 ## 依赖 codex
 
@@ -139,6 +140,21 @@ thread/start    {…, environments:[{environmentId:"sbx-<id>", cwd:"/workspace"}
 - 不做鉴权（由 k8s 网关负责），记录里没有密钥。
 - 不校验客户端传入的 `turn/start.environments`；客户端需要保证不传别的环境。
 
+## 多人聊天层（`chat/`）
+
+一个无状态、可多副本的 Node 服务，同一端口（默认 4910）提供：
+
+- **对话 API**（HTTP JSON，`Authorization: Bearer $HCODEX_CHAT_HOST_TOKEN`）：对话、参与者、外部来源映射，以及按查看者可见性的列表查询（筛选、按最后活动时间分页、参与人数，join 在 PG 里完成）。授权判断由宿主做，宿主把查看者 `{userId, tenant}` 传进来。路由见 `chat/src/http.ts`。
+- **网关**（WebSocket `/v1/native`，原生 app-server 协议）：宿主带上 `X-Hcodex-Conversation`、`X-Hcodex-Upstream`（app-server 副本池，headless Service 地址）和可选的 `X-Hcodex-Upstream-Headers`（JSON）连接。`turn/start` / `turn/steer` 的 params 里由宿主附上 `hcodex: {authorUserId, env}`，网关按对话的发起人改写：发起人 `turn/start` / `turn/steer`，其他人 `thread/queue/add` 后自动 `thread/queue/start`；生成 `clientUserMessageId = <作者>:<uuid>`；env 编码为 `fork.env.*`；输入被接受后记录参与者和最后活动时间。其他帧原样转发。
+- **路由**：按对话 ID 在副本池（DNS 每 5 秒刷新）中做 rendezvous hash；上游断开时以关闭码 4502 关闭下游，不重放输入。
+
+配置：`HCODEX_CHAT_HOST_TOKEN`、`HCODEX_CHAT_STORE`（`postgres://…`，表在首次启动时创建）、`HCODEX_CHAT_LISTEN`（默认 `0.0.0.0:4910`）、`HCODEX_CHAT_DRAIN_SECS`（SIGTERM 后先返回 503 再关闭连接，默认 5）。镜像：`docker build -t hcodex-chat chat`。
+
+```sh
+cd chat && npm ci && npm run typecheck
+HCODEX_PG_TEST_URL=postgres://… npm test   # 不设 URL 时 PG 用例跳过
+```
+
 ## 测试
 
 ```sh
@@ -161,9 +177,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 e2e 测试同时检查 codex fork 的 per-turn env 是否真的到达命令和 hook；升级 codex 后必须跑。
 
+## 发布
+
+`.github/workflows/release.yml`：在 Ubuntu 24.04 上构建 glibc 版 `codex-app-server`、`codex-exec-server`、`codex-code-mode-host`（strip 后），打成 `hcodex-linux-x64.tar.gz`，二进制在包的根目录，附 `build-info.json`（hcodex 与 codex 提交）。推送 `v*` tag 或手动触发并勾选 publish 时发布 GitHub Release；PR 改动该 workflow 时只构建不发布。
+
+运行环境需要 Ubuntu 24.04 或同等 glibc，以及 `libssl3`。Colony：解压后作为 `--build-context codex-artifacts=<目录>`，构建 `runtime-hcodex` stage。
+
 ## 后续
 
-- [ ] release：musl 静态包（`codex-app-server`、`codex-exec-server`、`codex-code-mode-host`），release 构建开 LTO。
 - [ ] PG 持久化的排队（目前排队在 pod 本地 sqlite，pod 挂了或 thread 迁走会丢）。
 - [ ] 交接 v2：在 step 边界挂起。
-- [ ] 多人聊天层。
+- [ ] 多人聊天层接入 Colony（对话数据迁移、网关切换）。
+- [ ] chat 镜像发布到镜像仓库。

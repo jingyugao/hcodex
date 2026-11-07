@@ -115,3 +115,37 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  chat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: hcodex
+          POSTGRES_DB: hcodex
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    defaults:
+      run:
+        working-directory: chat
+    env:
+      HCODEX_PG_TEST_URL: postgres://postgres:hcodex@127.0.0.1:5432/hcodex
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: chat/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - name: Build the image
+        working-directory: chat
+        run: docker build -t hcodex-chat:ci .
