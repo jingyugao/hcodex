@@ -11,11 +11,13 @@
 mod db;
 mod handoff;
 mod projection;
+mod queue;
 mod sandbox;
 mod store;
 
 pub use handoff::HandoffRecord;
 pub use handoff::PgHandoffStore;
+pub use queue::PgQueueStore;
 pub use sandbox::PgSandboxStore;
 /// Re-exported so dependents share this crate's driver feature setup.
 pub use sqlx;
@@ -63,16 +65,25 @@ pub const THREAD_STORE_ENV_VAR: &str = "HCODEX_THREAD_STORE";
 pub fn thread_store_from_env(
     default_model_provider_id: &str,
 ) -> Option<std::sync::Arc<dyn codex_thread_store::ThreadStore>> {
-    let url = std::env::var(THREAD_STORE_ENV_VAR)
-        .ok()
-        .filter(|url| !url.trim().is_empty())?;
-    let store = PgThreadStore::new(PgThreadStoreConfig {
-        url,
-        owner_id: owner_id_from_env(),
-        default_model_provider_id: default_model_provider_id.to_string(),
-    })
-    .unwrap_or_else(|err| {
-        panic!("cannot build postgres thread store from {THREAD_STORE_ENV_VAR}: {err}")
-    });
-    Some(std::sync::Arc::new(store))
+    PgThreadStore::from_env(default_model_provider_id).map(|store| std::sync::Arc::new(store) as _)
+}
+
+impl PgThreadStore {
+    /// Builds the configured Postgres store without erasing its type, so a host can share its
+    /// connection pool with [`PgQueueStore`]. Invalid configuration never falls back to disk.
+    pub fn from_env(default_model_provider_id: &str) -> Option<Self> {
+        let url = std::env::var(THREAD_STORE_ENV_VAR)
+            .ok()
+            .filter(|url| !url.trim().is_empty())?;
+        Some(
+            Self::new(PgThreadStoreConfig {
+                url,
+                owner_id: owner_id_from_env(),
+                default_model_provider_id: default_model_provider_id.to_string(),
+            })
+            .unwrap_or_else(|err| {
+                panic!("cannot build postgres thread store from {THREAD_STORE_ENV_VAR}: {err}")
+            }),
+        )
+    }
 }

@@ -61,7 +61,9 @@ HCODEX_THREAD_STORE=postgres://user:pass@host:5432/db
 - 所有权防护：每个 thread 有 `owner_id` + `epoch`。resume 时 `epoch+1`，旧 owner 的写入返回 `Conflict`，防止两个 pod 同时写。
 - URL 无效时启动直接 panic，**不会退回本地存储**。
 - 未实现（返回 Unsupported 或空）：sections、attachments、projects、全文搜索、按路径读、paginated 历史。
-- 排队（`thread/queue/*`）：使用本机 sqlite 队列库（上游 `Local` 配置下的 `LocalQueueStore`），不在 PG 中。队列只对本 pod 可见；`CODEX_SQLITE_HOME` 在 emptyDir 上时，pod 重建后队列丢失，在 PVC 上则保留。删除 PG thread 时不会清理它的队列项。
+- 排队（`thread/queue/*`）：同一个 `HCODEX_THREAD_STORE` 也开启 PG 排队（`PgQueueStore`，与 thread store 共用连接池，表见 `ha/pg/migrations/0003_queue.sql`），所有 pod 看到同一个队列；删除 thread 时级联删除队列。通过 codex fork 的注册口 `set_queue_store_factory` 接入。
+  - 每次队列写操作先锁 thread 行，再推进全局时钟（一行），版本号按提交顺序递增，`changes_since` 不会漏掉变更；代价是所有 thread 的队列写入在这一行上串行。
+  - 上游的派发顺序是"读队头 → 起 turn → 删除"，只有进程内的锁。同一个 thread 同时被两个 pod 加载时（扩缩容后重新 hash 的短时间内）两边可能各派发一次，非持有者那次会在写历史时被 epoch 防护拒绝。
 - 本地仍有的文件：app-server 自身的 sqlite（日志等）。部署时建议：`history.persistence = "none"`，`CODEX_SQLITE_HOME` 指向 emptyDir，控制日志级别。
 
 ### 跨 pod 交接（v1）
@@ -170,7 +172,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 | 测试 | 覆盖 |
 |---|---|
-| `ha/pg/tests/pg_store.rs` | 与 InMemory 行为对齐的往返、列表/归档/删除、旧 owner 被拒、交接只被认领一次 |
+| `ha/pg/tests/pg_store.rs` | 与 InMemory 行为对齐的往返、列表/归档/删除、旧 owner 被拒、交接只被认领一次、两个进程共享的队列（顺序、reorder、更新删除、`changes_since`、删除 thread 级联） |
 | `ha/ext/tests/handoff_e2e.rs` | file store：SIGTERM → 同一 turn_id 在另一进程恢复，`echo $TRACE_ID` 带 per-turn env；两个独立 `CODEX_HOME` 只共享 PG：恢复成功，且两边都没有对话文件 |
 | `ha/ext/tests/sandbox_e2e.rs` | 真实 `codex-exec-server` 作沙箱：绑定 → 杀掉进程 A → B 直接 resume，命令仍在沙箱执行 → fork 出的 thread 继承沙箱；静态槽位不需要 `environment/add`；本地环境未关闭时以退出码 78 退出；code mode：一个 JS cell 在沙箱里执行两条命令并带上 `fork.env.*` |
 | `ha/ext/tests/queue_env.rs` | 上游队列项 metadata：`queue/start` 和空闲派发都把 `fork.env.*` 带到 turn env；update 保留 |
@@ -185,7 +187,6 @@ e2e 测试同时检查 codex fork 的 per-turn env 是否真的到达命令和 h
 
 ## 后续
 
-- [ ] PG 持久化的排队（目前排队在 pod 本地 sqlite，pod 挂了或 thread 迁走会丢）。
 - [ ] 交接 v2：在 step 边界挂起。
 - [ ] 多人聊天层接入 Colony（对话数据迁移、网关切换）。
 - [ ] chat 镜像发布到镜像仓库。
