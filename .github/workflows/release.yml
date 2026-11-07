@@ -1,9 +1,7 @@
 name: Release
 
-# Linux x86_64 (glibc, built on Ubuntu 24.04) package for container images based on Ubuntu 24.04:
-# hcodex's codex-app-server plus upstream's codex-exec-server and codex-code-mode-host from the
-# pinned codex commit. The binaries sit at the archive root, so the extracted directory can be used
-# as Colony's `codex-artifacts` build context directly.
+# Fallback for building the package on GitHub; releases are normally built and published locally
+# with scripts/release.sh, which this workflow runs too.
 
 on:
   workflow_dispatch:
@@ -12,11 +10,6 @@ on:
         description: Publish the package as a GitHub Release (tag hcodex-<short sha>)
         type: boolean
         default: false
-  push:
-    tags: ['v*']
-  # Validate packaging changes before they merge; publishes nothing.
-  pull_request:
-    paths: ['.github/workflows/release.yml']
 
 permissions:
   contents: read
@@ -69,69 +62,13 @@ jobs:
           restore-keys: |
             release-v1-${{ hashFiles('Cargo.lock') }}-
 
-      - name: Fetch prebuilt V8 for the Code Mode host
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(awk '/^name = "v8"$/ { getline; gsub(/version = |"/, ""); print; exit }' codex/codex-rs/Cargo.lock)"
-          target=x86_64-unknown-linux-gnu
-          profile=ptrcomp_sandbox_release
-          dir="$RUNNER_TEMP/rusty-v8"
-          mkdir -p "$dir"
-          for file in "rusty_v8_${profile}_$target.sha256" "librusty_v8_${profile}_$target.a.gz" \
-            "src_binding_${profile}_$target.rs"; do
-            curl -fsSL -o "$dir/$file" \
-              "https://github.com/openai/codex/releases/download/rusty-v8-v$version/$file"
-          done
-          (cd "$dir" && sha256sum -c "rusty_v8_${profile}_$target.sha256")
-          {
-            echo "RUSTY_V8_ARCHIVE=$dir/librusty_v8_${profile}_$target.a.gz"
-            echo "RUSTY_V8_SRC_BINDING_PATH=$dir/src_binding_${profile}_$target.rs"
-          } >> "$GITHUB_ENV"
-
-      - name: Build release binaries
-        run: |
-          cargo build --release --locked -p hcodex-server --bin codex-app-server
-          cargo build --release --locked --manifest-path codex/codex-rs/Cargo.toml \
-            -p codex-exec-server-cli --bin codex-exec-server
-          cargo build --release --locked --manifest-path codex/codex-rs/Cargo.toml \
-            -p codex-code-mode-host --bin codex-code-mode-host
-
-      - name: Assemble the package
-        shell: bash
-        env:
-          CODEX_REV: ${{ steps.codex.outputs.rev }}
-        run: |
-          set -euo pipefail
-          package="$RUNNER_TEMP/hcodex"
-          mkdir -p "$package" dist
-          for binary in codex-app-server codex-exec-server codex-code-mode-host; do
-            install -m 0755 "target/release/$binary" "$package/$binary"
-            strip --strip-debug --strip-unneeded "$package/$binary"
-          done
-          cp LICENSE NOTICE "$package/"
-          jq -n --arg commit "$GITHUB_SHA" --arg codex "$CODEX_REV" \
-            '{repository:"jingyugao/hcodex",commit:$commit,codexRepository:"jingyugao/codex",
-              codexCommit:$codex,target:"x86_64-unknown-linux-gnu",builtOn:"ubuntu-24.04",
-              rust:"1.95.0",profile:"release"}' > "$package/build-info.json"
-          tar -czf dist/hcodex-linux-x64.tar.gz -C "$package" .
-          (cd dist && sha256sum hcodex-linux-x64.tar.gz > SHA256SUMS)
-          ls -l "$package" dist
-          echo "PACKAGE_DIR=$package" >> "$GITHUB_ENV"
-
-      - name: Smoke-test the binaries (the runner is Ubuntu 24.04)
-        run: |
-          for binary in codex-app-server codex-exec-server codex-code-mode-host; do
-            echo "== $binary needs:"; readelf -d "$PACKAGE_DIR/$binary" | grep NEEDED || true
-          done
-          "$PACKAGE_DIR/codex-app-server" --version
-          "$PACKAGE_DIR/codex-exec-server" --help > /dev/null
-          "$PACKAGE_DIR/codex-code-mode-host" --help > /dev/null
+      - name: Build, package and smoke-test
+        run: scripts/release.sh
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: hcodex-linux-x64
-          path: dist/
+          path: target/dist/
           if-no-files-found: error
 
       - name: Save build cache
@@ -146,7 +83,7 @@ jobs:
 
   publish:
     needs: package
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    if: inputs.publish
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -160,7 +97,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ $GITHUB_REF == refs/tags/v* ]]; then tag="${GITHUB_REF#refs/tags/}"; else tag="hcodex-${GITHUB_SHA:0:7}"; fi
+          tag="hcodex-${GITHUB_SHA:0:7}"
           gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "hcodex $tag (Linux x86_64, glibc)" \
             --notes "Built from $GITHUB_SHA; see build-info.json in the archive for the codex commit." \

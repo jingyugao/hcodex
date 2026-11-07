@@ -146,7 +146,9 @@ thread/start    {…, environments:[{environmentId:"sbx-<id>", cwd:"/workspace"}
 
 一个无状态、可多副本的 Node 服务，同一端口（默认 4910）提供：
 
-- **对话 API**（HTTP JSON，`Authorization: Bearer $HCODEX_CHAT_HOST_TOKEN`）：对话、参与者、外部来源映射，以及按查看者可见性的列表查询（筛选、按最后活动时间分页、参与人数，join 在 PG 里完成）。授权判断由宿主做，宿主把查看者 `{userId, tenant}` 传进来。路由见 `chat/src/http.ts`。
+- **对话 API**（HTTP JSON，`Authorization: Bearer $HCODEX_CHAT_HOST_TOKEN`）：对话、参与者、外部来源映射、按 ID 批量查询，以及查看者的对话列表（筛选、按最后活动时间分页、参与人数，join 在 PG 里完成）。路由见 `chat/src/http.ts`。
+  - 可见性只有一条：查看者参与过的对话（创建人自动是参与者）；`GET /v1/conversations/{id}/participants/{userId}` 判断单个对话（不是参与者时 404）。群、组织等视图由宿主用自己的映射查出对话 ID，再批量取；宿主负责这类授权。
+  - `metadata`：宿主自有的展示数据（如 tag），JSON 对象，最大 16KB；创建和 `PATCH` 时整体写入，原样返回，不支持查询。
 - **网关**（WebSocket `/v1/native`，原生 app-server 协议）：宿主带上 `X-Hcodex-Conversation`、`X-Hcodex-Upstream`（app-server 副本池，headless Service 地址）和可选的 `X-Hcodex-Upstream-Headers`（JSON）连接。`turn/start` / `turn/steer` 的 params 里由宿主附上 `hcodex: {authorUserId, env}`，网关按对话的发起人改写：发起人 `turn/start` / `turn/steer`，其他人 `thread/queue/add` 后自动 `thread/queue/start`；生成 `clientUserMessageId = <作者>:<uuid>`；env 编码为 `fork.env.*`；输入被接受后记录参与者和最后活动时间。其他帧原样转发。
 - **路由**：按对话 ID 在副本池（DNS 每 5 秒刷新）中做 rendezvous hash；上游断开时以关闭码 4502 关闭下游，不重放输入。
 
@@ -181,7 +183,17 @@ e2e 测试同时检查 codex fork 的 per-turn env 是否真的到达命令和 h
 
 ## 发布
 
-`.github/workflows/release.yml`：在 Ubuntu 24.04 上构建 glibc 版 `codex-app-server`、`codex-exec-server`、`codex-code-mode-host`（strip 后），打成 `hcodex-linux-x64.tar.gz`，二进制在包的根目录，附 `build-info.json`（hcodex 与 codex 提交）。推送 `v*` tag 或手动触发并勾选 publish 时发布 GitHub Release；PR 改动该 workflow 时只构建不发布。
+在本地构建和发布，CI 只在 tag 上做事后验证：
+
+```sh
+scripts/release.sh                    # 构建、打包、冒烟测试，产物在 target/dist/
+scripts/release.sh --publish v0.1.0   # 再以当前提交创建 tag 和 GitHub Release
+```
+
+- 包内容：glibc 版 `codex-app-server`、`codex-exec-server`、`codex-code-mode-host`（strip 后）打成 `hcodex-linux-x64.tar.gz`，二进制在包的根目录，附 `build-info.json`（hcodex 与 codex 提交、构建系统、是否有未提交改动）。
+- 要求 `./codex` 正好在 `codex.rev` 且没有改动；`--publish` 还要求工作区干净、当前提交已推送。在 Ubuntu 24.04 上构建，与运行镜像的 glibc 一致。
+- 发布前先在本地跑上面「测试」一节。发布创建的 `v*` tag 会触发 `.github/workflows/ci.yml`（Rust 测试和 chat 测试）作为事后验证；分支推送和 PR 不跑 CI。
+- `.github/workflows/release.yml` 是手动触发的备用方案：在 GitHub 上跑同一个脚本，勾选 publish 时发布为 `hcodex-<短 sha>`。
 
 运行环境需要 Ubuntu 24.04 或同等 glibc，以及 `libssl3`。Colony：解压后作为 `--build-context codex-artifacts=<目录>`，构建 `runtime-hcodex` stage。
 

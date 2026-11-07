@@ -1,9 +1,9 @@
 name: CI
 
+# After-the-fact verification of release tags; day-to-day checks run locally.
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
