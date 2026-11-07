@@ -4,10 +4,6 @@
 
 use std::sync::Arc;
 
-use hcodex_pg::HandoffRecord;
-use hcodex_pg::PgHandoffStore;
-use hcodex_pg::PgThreadStore;
-use hcodex_pg::PgThreadStoreConfig;
 use codex_protocol::ContextWindowId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
@@ -23,6 +19,8 @@ use codex_thread_store::DeleteThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::ListThreadsParams;
 use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::QueueStore;
+use codex_thread_store::QueuedUserSubmissionRecord;
 use codex_thread_store::ReadThreadParams;
 use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::SortDirection;
@@ -33,6 +31,11 @@ use codex_thread_store::ThreadSortKey;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateThreadMetadataParams;
+use hcodex_pg::HandoffRecord;
+use hcodex_pg::PgHandoffStore;
+use hcodex_pg::PgQueueStore;
+use hcodex_pg::PgThreadStore;
+use hcodex_pg::PgThreadStoreConfig;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -412,5 +415,83 @@ async fn handoff_is_claimed_exactly_once() -> TestResult {
     }
     assert_eq!(claimed, vec![record("turn-2")]);
     assert_eq!(handoffs.take(&thread_id).await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn queue_is_shared_ordered_and_reports_changes() -> TestResult {
+    let Some(url) = schema_url().await? else {
+        return Ok(());
+    };
+    let pg = store(&url, "pod-a")?;
+    let thread_id = ThreadId::new();
+    let quiet = ThreadId::new();
+    pg.create_thread(create_params(thread_id, None)).await?;
+    pg.create_thread(create_params(quiet, None)).await?;
+    let queue = PgQueueStore::new(pg.pool().clone());
+    // Another process sharing the database sees and orders the same queue.
+    let peer = PgQueueStore::new(hcodex_pg::connect_lazy(&url)?);
+    let payloads = |records: Vec<QueuedUserSubmissionRecord>| {
+        records
+            .into_iter()
+            .map(|record| record.payload)
+            .collect::<Vec<_>>()
+    };
+
+    let start = queue.change_version().await?;
+    let a = queue.enqueue(thread_id, "a".to_string()).await?;
+    let b = queue.enqueue(thread_id, "b".to_string()).await?;
+    let c = peer.enqueue(thread_id, "c".to_string()).await?;
+    assert_eq!(
+        payloads(peer.list_page(thread_id, 0, 10).await?),
+        ["a", "b", "c"]
+    );
+    assert_eq!(payloads(queue.list_page(thread_id, 1, 1).await?), ["b"]);
+    // Only the changed thread is reported, at its latest revision.
+    assert_eq!(
+        peer.changes_since(start, &[thread_id, quiet]).await?,
+        vec![(thread_id, queue.change_version().await?)]
+    );
+
+    assert!(matches!(
+        queue
+            .reorder(thread_id, vec![c.id.clone(), a.id.clone()])
+            .await,
+        Err(ThreadStoreError::InvalidRequest { .. })
+    ));
+    peer.reorder(thread_id, vec![c.id.clone(), a.id.clone(), b.id.clone()])
+        .await?;
+    queue.enqueue(thread_id, "d".to_string()).await?;
+    assert_eq!(
+        payloads(queue.list_page(thread_id, 0, 10).await?),
+        ["c", "a", "b", "d"]
+    );
+
+    let updated = queue
+        .update(thread_id, a.id.clone(), "a2".to_string())
+        .await?;
+    assert_eq!(updated.map(|record| record.payload), Some("a2".to_string()));
+    assert!(peer.delete(thread_id, b.id.clone()).await?);
+    assert!(!queue.delete(thread_id, b.id.clone()).await?);
+    assert!(
+        queue
+            .update(thread_id, b.id.clone(), "gone".to_string())
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        payloads(queue.list_page(thread_id, 0, 10).await?),
+        ["c", "a2", "d"]
+    );
+    let now = queue.change_version().await?;
+    assert_eq!(queue.changes_since(now, &[thread_id, quiet]).await?, vec![]);
+
+    assert!(matches!(
+        queue.enqueue(ThreadId::new(), "x".to_string()).await,
+        Err(ThreadStoreError::ThreadNotFound { .. })
+    ));
+    // Deleting the thread deletes its queue.
+    pg.delete_thread(DeleteThreadParams { thread_id }).await?;
+    assert!(queue.list_page(thread_id, 0, 10).await?.is_empty());
     Ok(())
 }
