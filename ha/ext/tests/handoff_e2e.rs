@@ -191,6 +191,8 @@ async fn run_handoff(
 }
 
 /// Rollout and history files that would hold conversation content.
+/// Codex conversation (rollout) files under `dir`, compressed or not. Other `.jsonl` files, such as
+/// fixtures in plugin repositories Codex clones at startup, are not conversation data.
 fn conversation_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     let mut found = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -200,8 +202,12 @@ fn conversation_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
             if path.is_dir() {
                 pending.push(path);
             } else if path
-                .extension()
-                .is_some_and(|ext| ext == "jsonl" || ext == "zst")
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("rollout-")
+                        && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+                })
             {
                 found.push(path);
             }
