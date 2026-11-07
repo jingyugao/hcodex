@@ -114,12 +114,13 @@ export function createConversationStore(pool: pg.Pool) {
     /** One conversation per external origin; concurrent callers get the same conversation. */
     async ensureForOrigin(origin: ConversationOrigin, input: NewConversation): Promise<Conversation> {
       try {
+        // The origin references the conversation, so insert it first; a taken origin rolls both back.
         await transaction(async (db) => {
+          await insert(db, input);
           await db.query(
             "INSERT INTO hcodex_conversation_origins (namespace, key, conversation_id) VALUES ($1, $2, $3)",
             [origin.namespace, origin.key, input.id],
           );
-          await insert(db, input);
         });
         return mustFind(input.id);
       } catch (error) {
