@@ -45,7 +45,7 @@ codex fork                 jingyugao/codex：per-turn env（fork.env.*）+ 注�
 
 ## 功能
 
-per-turn env（`fork.env.*`）由 codex fork 提供，见 fork 仓库的 `docs/fork/handoff.md`。
+per-turn env（`fork.env.*`）由 codex fork 提供，见 [fork 仓库首页](https://github.com/jingyugao/codex)（`.github/README.md`）。
 
 数据库对象沿用旧名字（表 `codex_fork_*`、NOTIFY 通道 `codex_fork_handoff`），与已有数据兼容。
 
