@@ -8,22 +8,28 @@ import { ConversationConflict, ConversationNotFound, InvalidRequest } from "./ty
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const id = z.string().min(1).max(128);
+const viewerInput = z.object({ userId: id }).strict();
+const MAX_METADATA_BYTES = 16 * 1024;
+const metadata = z
+  .record(z.string(), z.unknown())
+  .refine((value) => Buffer.byteLength(JSON.stringify(value)) <= MAX_METADATA_BYTES, {
+    message: `metadata exceeds ${MAX_METADATA_BYTES} bytes`,
+  });
 const conversationFields = z
   .object({
     id: id.optional(),
     ownerId: id,
-    tenant: z.string().max(256).default(""),
     agentId: id,
     workspaceId: id,
     runtimeId: id,
     title: z.string().trim().min(1).max(200),
     source: z.string().min(1).max(64),
+    metadata: metadata.optional(),
   })
   .strict();
 const searchInput = z
   .object({
-    viewer: z.object({ userId: id, tenant: z.string().max(256).default("") }).strict(),
-    scope: z.enum(["mine", "team"]).default("mine"),
+    viewer: viewerInput,
     relation: z.enum(["all", "created", "participated"]).default("all"),
     agentId: id.optional(),
     ownerId: id.optional(),
@@ -33,10 +39,7 @@ const searchInput = z
     cursor: z.string().max(1024).optional(),
     limit: z.number().int().min(1).max(100).default(30),
   })
-  .strict()
-  .refine((input) => input.scope !== "team" || input.relation === "all", {
-    message: "relation filters apply to scope=mine",
-  });
+  .strict();
 const timestamp = z.string().datetime();
 const importInput = z
   .object({
@@ -111,8 +114,15 @@ export function createHttpApi(options: { store: ConversationStore; hostToken: st
     }],
     ["POST", /^\/v1\/conversations\/search$/, async (_m, request) => [200, await store.search(searchInput.parse(await body(request)))]],
     ["POST", /^\/v1\/conversations\/owners$/, async (_m, request) => {
-      const { ownerIds } = z.object({ ownerIds: z.array(id).max(1000) }).strict().parse(await body(request));
-      return [200, { ownerIds: await store.owners(ownerIds) }];
+      const { ownerIds, viewer } = z
+        .object({ ownerIds: z.array(id).max(1000), viewer: viewerInput })
+        .strict()
+        .parse(await body(request));
+      return [200, { ownerIds: await store.owners(ownerIds, viewer) }];
+    }],
+    ["POST", /^\/v1\/conversations\/batch$/, async (_m, request) => {
+      const { ids } = z.object({ ids: z.array(id).max(200) }).strict().parse(await body(request));
+      return [200, { items: await store.getMany(ids) }];
     }],
     ["PUT", /^\/v1\/origins\/([^/]+)\/([^/]+)$/, async ([namespace, key], request) => {
       const input = conversationFields.parse(await body(request));
@@ -128,7 +138,11 @@ export function createHttpApi(options: { store: ConversationStore; hostToken: st
     }],
     ["PATCH", /^\/v1\/conversations\/([^/]+)$/, async ([conversationId], request) => {
       const patch = z
-        .object({ title: z.string().trim().min(1).max(200).optional(), archived: z.boolean().optional() })
+        .object({
+          title: z.string().trim().min(1).max(200).optional(),
+          archived: z.boolean().optional(),
+          metadata: metadata.optional(),
+        })
         .strict()
         .parse(await body(request));
       return [200, await store.update(decodeURIComponent(conversationId!), patch)];
@@ -147,6 +161,11 @@ export function createHttpApi(options: { store: ConversationStore; hostToken: st
       const { userId } = z.object({ userId: id }).strict().parse(await body(request));
       await store.addParticipant(decodeURIComponent(conversationId!), userId);
       return [204];
+    }],
+    ["GET", /^\/v1\/conversations\/([^/]+)\/participants\/([^/]+)$/, async ([conversationId, userId]) => {
+      const value = await store.getParticipant(decodeURIComponent(conversationId!), decodeURIComponent(userId!));
+      if (!value) throw new ConversationNotFound();
+      return [200, value];
     }],
     ["GET", /^\/v1\/conversations\/([^/]+)\/participants$/, async ([conversationId], _request, url) => {
       const query = z

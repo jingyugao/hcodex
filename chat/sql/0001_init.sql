@@ -3,8 +3,6 @@
 CREATE TABLE IF NOT EXISTS hcodex_conversations (
   id text PRIMARY KEY,
   owner_id text NOT NULL,
-  -- Owner's tenant when the conversation was created; '' means visible to the owner only.
-  tenant text NOT NULL DEFAULT '',
   agent_id text NOT NULL,
   workspace_id text NOT NULL,
   runtime_id text NOT NULL,
@@ -12,6 +10,8 @@ CREATE TABLE IF NOT EXISTS hcodex_conversations (
   title text NOT NULL,
   source text NOT NULL,
   archived boolean NOT NULL DEFAULT false,
+  -- Host-owned display data (tags and the like); stored and returned as is, never queried.
+  metadata jsonb NOT NULL DEFAULT '{}',
   created_at timestamptz(3) NOT NULL DEFAULT now(),
   updated_at timestamptz(3) NOT NULL DEFAULT now(),
   last_activity_at timestamptz(3) NOT NULL DEFAULT now()
@@ -22,8 +22,6 @@ CREATE INDEX IF NOT EXISTS hcodex_conversations_activity
   ON hcodex_conversations (last_activity_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS hcodex_conversations_owner_activity
   ON hcodex_conversations (owner_id, last_activity_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS hcodex_conversations_tenant_activity
-  ON hcodex_conversations (tenant, last_activity_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS hcodex_conversations_agent_activity
   ON hcodex_conversations (agent_id, last_activity_at DESC, id DESC);
 
@@ -45,3 +43,6 @@ CREATE TABLE IF NOT EXISTS hcodex_conversation_origins (
 );
 CREATE INDEX IF NOT EXISTS hcodex_conversation_origins_conversation
   ON hcodex_conversation_origins (conversation_id);
+
+-- Tables created before metadata existed. Their unused `tenant` column is left in place.
+ALTER TABLE hcodex_conversations ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}';

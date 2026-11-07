@@ -3,8 +3,6 @@ export interface Conversation {
   id: string;
   /** Immutable creator; the only participant whose inputs start or join turns directly. */
   ownerId: string;
-  /** Owner's tenant at creation; '' keeps the conversation visible to the owner only. */
-  tenant: string;
   agentId: string;
   workspaceId: string;
   /** App-server pool (runtime) the thread lives in. */
@@ -13,6 +11,8 @@ export interface Conversation {
   title: string;
   source: string;
   archived: boolean;
+  /** Host-owned display data such as tags; stored as is and replaced whole, never queried. */
+  metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
   /** Last accepted input; a list sort key, not Codex activity. */
@@ -21,15 +21,8 @@ export interface Conversation {
 
 export type NewConversation = Pick<
   Conversation,
-  | "id"
-  | "ownerId"
-  | "tenant"
-  | "agentId"
-  | "workspaceId"
-  | "runtimeId"
-  | "title"
-  | "source"
->;
+  "id" | "ownerId" | "agentId" | "workspaceId" | "runtimeId" | "title" | "source"
+> & { metadata?: Record<string, unknown> };
 
 export interface Participant {
   conversationId: string;
@@ -44,9 +37,9 @@ export interface ConversationOrigin {
 }
 
 export interface SearchQuery {
-  viewer: { userId: string; tenant: string };
-  /** `mine` limits to conversations the viewer takes part in; `team` to everything visible. */
-  scope: "mine" | "team";
+  /** Only conversations the viewer takes part in (the owner always does). */
+  viewer: { userId: string };
+  /** `created`: the viewer is the owner; `participated`: someone else is. */
   relation: "all" | "created" | "participated";
   agentId?: string;
   ownerId?: string;

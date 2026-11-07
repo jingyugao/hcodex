@@ -20,11 +20,13 @@ const MIGRATION_LOCK = 0x68636f646578; // "hcodex"
 const UNIQUE_VIOLATION = "23505";
 const unique = (error: unknown) => (error as { code?: string })?.code === UNIQUE_VIOLATION;
 const iso = (value: Date | string) => new Date(value).toISOString();
+/** SQL condition: the viewer (`$1`) takes part in conversation `c`. */
+const TAKES_PART =
+  "EXISTS (SELECT 1 FROM hcodex_conversation_participants p WHERE p.conversation_id = c.id AND p.user_id = $1)";
 
 const conversation = (r: Row): Conversation => ({
   id: r.id,
   ownerId: r.owner_id,
-  tenant: r.tenant,
   agentId: r.agent_id,
   workspaceId: r.workspace_id,
   runtimeId: r.runtime_id,
@@ -32,6 +34,7 @@ const conversation = (r: Row): Conversation => ({
   title: r.title,
   source: r.source,
   archived: r.archived,
+  metadata: r.metadata,
   createdAt: iso(r.created_at),
   updatedAt: iso(r.updated_at),
   lastActivityAt: iso(r.last_activity_at),
@@ -45,7 +48,7 @@ const participant = (r: Row): Participant => ({
 
 /** Rows as exported from another store, for a one-time import. */
 export interface ImportBatch {
-  conversations?: Conversation[];
+  conversations?: (Omit<Conversation, "metadata"> & { metadata?: Record<string, unknown> })[];
   participants?: Participant[];
   origins?: (ConversationOrigin & { conversationId: string })[];
 }
@@ -66,9 +69,10 @@ export function createConversationStore(pool: pg.Pool) {
   };
   const insert = async (db: pg.PoolClient, input: NewConversation) => {
     await db.query(
-      `INSERT INTO hcodex_conversations (id, owner_id, tenant, agent_id, workspace_id, runtime_id, title, source)
+      `INSERT INTO hcodex_conversations (id, owner_id, agent_id, workspace_id, runtime_id, title, source, metadata)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [input.id, input.ownerId, input.tenant, input.agentId, input.workspaceId, input.runtimeId, input.title, input.source],
+      [input.id, input.ownerId, input.agentId, input.workspaceId, input.runtimeId, input.title, input.source,
+        input.metadata ?? {}],
     );
     await db.query(
       `INSERT INTO hcodex_conversation_participants (conversation_id, user_id) VALUES ($1, $2)
@@ -136,6 +140,13 @@ export function createConversationStore(pool: pg.Pool) {
 
     get: find,
 
+    /** The conversations among these IDs that exist, in no particular order. */
+    async getMany(ids: string[]): Promise<Conversation[]> {
+      if (!ids.length) return [];
+      const { rows } = await pool.query("SELECT * FROM hcodex_conversations WHERE id = ANY($1::text[])", [ids]);
+      return rows.map(conversation);
+    },
+
     async getByThread(runtimeId: string, threadId: string): Promise<Conversation | undefined> {
       const row = await one("SELECT * FROM hcodex_conversations WHERE runtime_id = $1 AND thread_id = $2", [
         runtimeId,
@@ -144,11 +155,15 @@ export function createConversationStore(pool: pg.Pool) {
       return row ? conversation(row) : undefined;
     },
 
-    async update(id: string, patch: { title?: string; archived?: boolean }): Promise<Conversation> {
+    /** `metadata` replaces the stored value whole. */
+    async update(
+      id: string,
+      patch: { title?: string; archived?: boolean; metadata?: Record<string, unknown> },
+    ): Promise<Conversation> {
       const row = await one(
         `UPDATE hcodex_conversations SET title = COALESCE($2, title), archived = COALESCE($3, archived),
-           updated_at = now() WHERE id = $1 RETURNING *`,
-        [id, patch.title ?? null, patch.archived ?? null],
+           metadata = COALESCE($4, metadata), updated_at = now() WHERE id = $1 RETURNING *`,
+        [id, patch.title ?? null, patch.archived ?? null, patch.metadata ?? null],
       );
       if (!row) throw new ConversationNotFound();
       return conversation(row);
@@ -193,6 +208,14 @@ export function createConversationStore(pool: pg.Pool) {
       );
     },
 
+    async getParticipant(conversationId: string, userId: string): Promise<Participant | undefined> {
+      const row = await one(
+        "SELECT * FROM hcodex_conversation_participants WHERE conversation_id = $1 AND user_id = $2",
+        [conversationId, userId],
+      );
+      return row ? participant(row) : undefined;
+    },
+
     async listParticipants(conversationId: string, query: { after?: string; limit?: number } = {}): Promise<Participant[]> {
       const limit = Math.max(1, Math.min(100, Math.floor(query.limit ?? 50)));
       const { rows } = await pool.query(
@@ -203,20 +226,15 @@ export function createConversationStore(pool: pg.Pool) {
       return rows.map(participant);
     },
 
-    /** Visible conversations newest first. Visibility: the viewer's own, or the viewer's tenant. */
+    /** The viewer's conversations (those they take part in) newest first. */
     async search(query: SearchQuery): Promise<SearchPage> {
       const { cursor, limit, ...filters } = query;
       const filter = createHash("sha256").update(JSON.stringify(filters)).digest("hex");
-      const args: unknown[] = [query.viewer.userId, query.viewer.tenant];
+      const args: unknown[] = [query.viewer.userId];
       const arg = (value: unknown) => `$${args.push(value)}`;
-      const clauses = ["(c.owner_id = $1 OR ($2 <> '' AND c.tenant = $2))"];
-      const takesPart =
-        "EXISTS (SELECT 1 FROM hcodex_conversation_participants p WHERE p.conversation_id = c.id AND p.user_id = $1)";
-      if (query.scope === "mine") {
-        if (query.relation === "created") clauses.push("c.owner_id = $1");
-        else clauses.push(takesPart);
-        if (query.relation === "participated") clauses.push("c.owner_id <> $1");
-      }
+      const clauses = [TAKES_PART];
+      if (query.relation === "created") clauses.push("c.owner_id = $1");
+      if (query.relation === "participated") clauses.push("c.owner_id <> $1");
       if (query.agentId) clauses.push(`c.agent_id = ${arg(query.agentId)}`);
       if (query.ownerId) clauses.push(`c.owner_id = ${arg(query.ownerId)}`);
       if (query.query)
@@ -255,12 +273,13 @@ export function createConversationStore(pool: pg.Pool) {
       };
     },
 
-    /** Which of these users created at least one conversation. */
-    async owners(ownerIds: string[]): Promise<string[]> {
+    /** Which of these users own a conversation the viewer takes part in. */
+    async owners(ownerIds: string[], viewer: SearchQuery["viewer"]): Promise<string[]> {
       if (!ownerIds.length) return [];
       const { rows } = await pool.query(
-        "SELECT DISTINCT owner_id FROM hcodex_conversations WHERE owner_id = ANY($1::text[])",
-        [ownerIds],
+        `SELECT DISTINCT c.owner_id FROM hcodex_conversations c
+         WHERE ${TAKES_PART} AND c.owner_id = ANY($2::text[])`,
+        [viewer.userId, ownerIds],
       );
       return rows.map((row) => row.owner_id as string);
     },
@@ -270,16 +289,16 @@ export function createConversationStore(pool: pg.Pool) {
       await transaction(async (db) => {
         for (const c of batch.conversations ?? [])
           await db.query(
-            `INSERT INTO hcodex_conversations (id, owner_id, tenant, agent_id, workspace_id, runtime_id, thread_id,
-               title, source, archived, created_at, updated_at, last_activity_at)
+            `INSERT INTO hcodex_conversations (id, owner_id, agent_id, workspace_id, runtime_id, thread_id,
+               title, source, archived, metadata, created_at, updated_at, last_activity_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-             ON CONFLICT (id) DO UPDATE SET owner_id = EXCLUDED.owner_id, tenant = EXCLUDED.tenant,
+             ON CONFLICT (id) DO UPDATE SET owner_id = EXCLUDED.owner_id,
                agent_id = EXCLUDED.agent_id, workspace_id = EXCLUDED.workspace_id, runtime_id = EXCLUDED.runtime_id,
                thread_id = EXCLUDED.thread_id, title = EXCLUDED.title, source = EXCLUDED.source,
-               archived = EXCLUDED.archived, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at,
+               archived = EXCLUDED.archived, metadata = EXCLUDED.metadata, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at,
                last_activity_at = EXCLUDED.last_activity_at`,
-            [c.id, c.ownerId, c.tenant, c.agentId, c.workspaceId, c.runtimeId, c.threadId, c.title, c.source,
-              c.archived, c.createdAt, c.updatedAt, c.lastActivityAt],
+            [c.id, c.ownerId, c.agentId, c.workspaceId, c.runtimeId, c.threadId, c.title, c.source,
+              c.archived, c.metadata ?? {}, c.createdAt, c.updatedAt, c.lastActivityAt],
           );
         for (const p of batch.participants ?? [])
           await db.query(
