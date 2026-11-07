@@ -99,8 +99,6 @@ jobs:
           cargo build --manifest-path codex/codex-rs/Cargo.toml -p codex-code-mode-host --bin codex-code-mode-host
 
       - name: Test
-        env:
-          RUST_MIN_STACK: '8388608'
         run: cargo test -p hcodex-pg -p hcodex-ha
 
       - name: Lint

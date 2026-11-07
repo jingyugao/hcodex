@@ -172,6 +172,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 三个二进制要在同一个 target 目录里，e2e 测试从那里找它们。
 
+本地 PG：k3s `infrastructure` 里有专给测试用的账号和库 `hcodex_github_ci`（测试各自建临时 schema，跑完删除），连接串在 Secret `hcodex-github-ci`：
+
+```sh
+kubectl --context k3s -n infrastructure port-forward --address 127.0.0.1 svc/postgres 15432:5432 &
+export HCODEX_PG_TEST_URL="postgres://hcodex_github_ci:$(kubectl --context k3s -n infrastructure \
+  get secret hcodex-github-ci -o jsonpath='{.data.PGPASSWORD}' | base64 -d)@127.0.0.1:15432/hcodex_github_ci"
+```
+
 | 测试 | 覆盖 |
 |---|---|
 | `ha/pg/tests/pg_store.rs` | 与 InMemory 行为对齐的往返、列表/归档/删除、旧 owner 被拒、交接只被认领一次、两个进程共享的队列（顺序、reorder、更新删除、`changes_since`、删除 thread 级联） |
