@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: hcodex
+          POSTGRES_DB: hcodex
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    env:
+      CARGO_BUILD_JOBS: '3'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      HCODEX_PG_TEST_URL: postgres://postgres:hcodex@127.0.0.1:5432/hcodex
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Read the pinned codex commit
+        id: codex
+        run: echo "rev=$(tr -d '[:space:]' < codex.rev)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: jingyugao/codex
+          ref: ${{ steps.codex.outputs.rev }}
+          path: codex
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev libasound2-dev
+
+      - name: Restore build cache
+        id: cache
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-v1-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ci-v1-${{ hashFiles('Cargo.lock') }}-
+
+      - name: Fetch prebuilt V8 for the Code Mode host
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk '/^name = "v8"$/ { getline; gsub(/version = |"/, ""); print; exit }' codex/codex-rs/Cargo.lock)"
+          target=x86_64-unknown-linux-gnu
+          profile=ptrcomp_sandbox_release
+          dir="$RUNNER_TEMP/rusty-v8"
+          mkdir -p "$dir"
+          for file in "rusty_v8_${profile}_$target.sha256" "librusty_v8_${profile}_$target.a.gz" \
+            "src_binding_${profile}_$target.rs"; do
+            curl -fsSL -o "$dir/$file" \
+              "https://github.com/openai/codex/releases/download/rusty-v8-v$version/$file"
+          done
+          (cd "$dir" && sha256sum -c "rusty_v8_${profile}_$target.sha256")
+          {
+            echo "RUSTY_V8_ARCHIVE=$dir/librusty_v8_${profile}_$target.a.gz"
+            echo "RUSTY_V8_SRC_BINDING_PATH=$dir/src_binding_${profile}_$target.rs"
+          } >> "$GITHUB_ENV"
+
+      - name: Check that the synced build settings match codex
+        run: |
+          scripts/sync-codex.sh
+          git diff --exit-code -- Cargo.toml Cargo.lock rust-toolchain.toml clippy.toml rustfmt.toml
+
+      - name: Build the binaries the end-to-end tests run
+        run: |
+          cargo build -p hcodex-server --bin codex-app-server
+          cargo build --manifest-path codex/codex-rs/Cargo.toml -p codex-exec-server-cli --bin codex-exec-server
+          cargo build --manifest-path codex/codex-rs/Cargo.toml -p codex-code-mode-host --bin codex-code-mode-host
+
+      - name: Test
+        env:
+          RUST_MIN_STACK: '8388608'
+        run: cargo test -p hcodex-pg -p hcodex-ha
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Save build cache
+        if: always() && !cancelled() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
