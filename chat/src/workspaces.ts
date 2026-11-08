@@ -71,9 +71,9 @@ export async function inspectWorkspace(
     };
     const status = result.thread?.status?.type;
     if (status === "active") return true;
-    if (status !== "idle" && status !== "notLoaded")
+    if (status !== "idle" && status !== "notLoaded" && status !== "systemError")
       throw new Error(`Unknown thread activity: ${status}`);
-    if (status === "idle") {
+    if (status !== "notLoaded") {
       const terminals = (await client.request(
         "thread/backgroundTerminals/list",
         { threadId, limit: 1 },
@@ -141,9 +141,9 @@ const route = (r: RouteRow): WorkspaceRoute => ({
 const canonical = (targets: readonly string[]) => [...new Set(targets)].sort();
 
 /**
- * A short row lock serializes admission and switching across all SDK processes. Unknown sends
- * remain in-flight even after their diagnostic TTL; only a reply or proven process death clears
- * them. Switching leases may expire safely: every commit checks its unique token and epoch.
+ * Native conversation state determines activity. Short-lived input reservations only coordinate
+ * sending with switching; disconnected callers cannot leave a permanent activity marker.
+ * Switching leases may expire safely: every commit checks its unique token and epoch.
  */
 export function createWorkspaceRouter(
   pool: pg.Pool,
@@ -221,7 +221,7 @@ export function createWorkspaceRouter(
   const pending = async (runtimeId: string, workspaceId: string) =>
     (
       await pool.query(
-        "SELECT 1 FROM hcodex_workspace_inflight WHERE runtime_id=$1 AND workspace_id=$2 LIMIT 1",
+        "SELECT 1 FROM hcodex_workspace_inflight WHERE runtime_id=$1 AND workspace_id=$2 AND expires_at > clock_timestamp() LIMIT 1",
         [runtimeId, workspaceId],
       )
     ).rowCount !== 0;
@@ -322,7 +322,6 @@ export function createWorkspaceRouter(
       }
     },
     async isActive(runtimeId, workspaceId) {
-      if (await pending(runtimeId, workspaceId)) return true;
       const target = await router.route(runtimeId, workspaceId);
       return options.inspect(
         runtimeId,
@@ -382,6 +381,12 @@ export function createWorkspaceRouter(
       });
       if ("result" in acquired) return acquired.result!;
       try {
+        // A crashed caller may leave an input reservation. Expiry permits another native
+        // activity check, never replay of an input whose outcome is unknown.
+        await pool.query(
+          "DELETE FROM hcodex_workspace_inflight WHERE runtime_id=$1 AND workspace_id=$2 AND expires_at <= clock_timestamp()",
+          [runtimeId, workspaceId],
+        );
         const until = Date.now() + switchMs / 2;
         while (await pending(runtimeId, workspaceId)) {
           if (Date.now() >= until) return "still_active";

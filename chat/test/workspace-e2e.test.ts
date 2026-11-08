@@ -605,6 +605,34 @@ test(
         async () => !(await routerA.isActive(runtimeId, workspaceId)),
         20_000,
       );
+      const viewer = await virtual(routerB);
+      await new Promise<void>((resolve, reject) => {
+        viewer.socket.send(
+          JSON.stringify({
+            id: "closing-view",
+            method: "thread/read",
+            params: { threadId, includeTurns: false },
+          }),
+          {},
+          (error?: Error) => {
+            viewer.close();
+            if (error) reject(error);
+            else resolve();
+          },
+        );
+      });
+      assert.equal(
+        Number(
+          (
+            await poolA.query(
+              "SELECT count(*) FROM hcodex_workspace_inflight WHERE runtime_id=$1 AND workspace_id=$2",
+              [runtimeId, workspaceId],
+            )
+          ).rows[0].count,
+        ),
+        0,
+        "closing a history viewer must not leave input reservations",
+      );
       barrierEnabled = true;
       inspections = 0;
       const switching = routerA.switchWorkspace(
@@ -614,6 +642,15 @@ test(
         replacementA,
       );
       await until("second activity check", () => inspectionBarrierEntered);
+      const history = await clientB.request("thread/read", {
+        threadId,
+        includeTurns: false,
+      });
+      assert.equal(
+        history.thread.id,
+        threadId,
+        "history remains readable while input admission is closed",
+      );
       let raceAnswered = false;
       const race = clientB
         .request("turn/start", {

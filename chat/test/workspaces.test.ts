@@ -39,7 +39,7 @@ before(async () => {
     inspect: async () => inspect(),
     pollMs: 2,
     switchMs: 1000,
-    inflightMs: 5,
+    inflightMs: 1000,
     waitMs: 3000,
   };
   router = createWorkspaceRouter(pool, options);
@@ -87,22 +87,17 @@ test(
 );
 
 test(
-  "expired sends block switching until a definite reply; waiting input uses the new target",
+  "activity only reflects native conversations; input admission still coordinates a switch",
   { skip: skipped },
   async () => {
     inspect = async () => false;
     await router.setTargets("inflight", [oldTarget]);
     const input = await router.admit("inflight", "w");
     await peer.setTargets("inflight", [newTarget]);
-    await sleep(10);
     assert.equal(
       await peer.isActive("inflight", "w"),
-      true,
-      "TTL is diagnostic, not proof of non-execution",
-    );
-    assert.equal(
-      await peer.switchWorkspace("inflight", "w", oldTarget, newTarget),
-      "still_active",
+      false,
+      "RPC bookkeeping must not make a native idle conversation active",
     );
     const switching = peer.switchWorkspace(
       "inflight",
@@ -126,6 +121,39 @@ test(
     const admitted = await waiting;
     assert.equal(admitted.target, newTarget);
     await admitted.complete();
+  },
+);
+
+test(
+  "an abandoned input reservation expires without pinning an idle conversation",
+  { skip: skipped },
+  async () => {
+    inspect = async () => false;
+    const shortReservation = createWorkspaceRouter(pool, {
+      inspect: async () => inspect(),
+      inflightMs: 5,
+      pollMs: 2,
+    });
+    await router.setTargets("abandoned", [oldTarget]);
+    await shortReservation.admit("abandoned", "w");
+    await router.setTargets("abandoned", [newTarget]);
+    await sleep(15);
+    assert.equal(await router.isActive("abandoned", "w"), false);
+    assert.equal(
+      await peer.switchWorkspace("abandoned", "w", oldTarget, newTarget),
+      "switched",
+    );
+    assert.equal(
+      Number(
+        (
+          await pool.query(
+            "SELECT count(*) FROM hcodex_workspace_inflight WHERE runtime_id=$1",
+            ["abandoned"],
+          )
+        ).rows[0].count,
+      ),
+      0,
+    );
   },
 );
 
@@ -335,7 +363,7 @@ test(
 );
 
 test(
-  "only confirmed retirement clears an unknown send, without replay",
+  "confirmed process retirement reassigns routes without replaying inputs",
   { skip: skipped },
   async () => {
     inspect = async () => false;
@@ -356,6 +384,7 @@ test("unloaded threads still check the persistent queue; terminal and goal activ
   const calls: string[] = [];
   let queued = true;
   let loaded = false;
+  let systemError = false;
   let terminal = false;
   let goal = false;
   const client = {
@@ -363,7 +392,13 @@ test("unloaded threads still check the persistent queue; terminal and goal activ
       calls.push(method);
       if (method === "thread/queue/list") return { data: queued ? [{}] : [] };
       if (method === "thread/read")
-        return { thread: { status: { type: loaded ? "idle" : "notLoaded" } } };
+        return {
+          thread: {
+            status: {
+              type: systemError ? "systemError" : loaded ? "idle" : "notLoaded",
+            },
+          },
+        };
       if (method === "thread/backgroundTerminals/list")
         return { data: terminal ? [{}] : [] };
       if (method === "thread/goal/get")
@@ -377,7 +412,10 @@ test("unloaded threads still check the persistent queue; terminal and goal activ
   assert.equal(await inspectWorkspace(client, ["thread"]), false);
   loaded = terminal = true;
   assert.equal(await inspectWorkspace(client, ["thread"]), true);
+  systemError = true;
+  assert.equal(await inspectWorkspace(client, ["thread"]), true);
   terminal = false;
+  assert.equal(await inspectWorkspace(client, ["thread"]), false);
   goal = true;
   assert.equal(
     await inspectWorkspace(client, ["thread"], { checkGoals: true }),

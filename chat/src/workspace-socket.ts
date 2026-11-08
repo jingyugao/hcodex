@@ -4,6 +4,20 @@ import { WebSocket, type RawData } from "ws";
 import type { Frame, Log } from "./session.js";
 import type { WorkspaceAdmission, WorkspaceRouter } from "./workspaces.js";
 
+// Reading a view neither starts work nor participates in the workspace switch gate.
+// Unknown methods remain protected; thread/resume is intentionally not a read.
+const READ_METHODS = new Set([
+  "thread/read",
+  "thread/list",
+  "thread/loaded/list",
+  "thread/turns/list",
+  "thread/items/list",
+  "thread/queue/list",
+  "thread/backgroundTerminals/list",
+  "thread/goal/get",
+  "model/list",
+]);
+
 /** Small socket contract shared by raw proxies and JSON-RPC transports. */
 export interface NativeSocket {
   readonly readyState: number;
@@ -41,8 +55,8 @@ export interface WorkspaceSocketOptions {
 }
 
 /**
- * A virtual native socket. Every request is admitted on its current workspace target before
- * sending. If a switch completed while the caller waited, initialize/resume the new connection
+ * A virtual native socket. Mutating requests are admitted on their current workspace target
+ * before sending. If a switch completed while the caller waited, initialize/resume the connection
  * and send the original frame there once. No native input is retried after it has been sent.
  */
 export class WorkspaceSocket extends EventEmitter implements NativeSocket {
@@ -63,7 +77,7 @@ export class WorkspaceSocket extends EventEmitter implements NativeSocket {
   private readonly pending = new Map<
     string | number,
     {
-      admission: WorkspaceAdmission;
+      admission?: WorkspaceAdmission;
       method: string;
       params?: Record<string, unknown>;
     }
@@ -163,7 +177,8 @@ export class WorkspaceSocket extends EventEmitter implements NativeSocket {
     for (const waiter of this.internal.values())
       waiter.reject(new Error("Workspace socket closed"));
     this.internal.clear();
-    // Sent requests deliberately keep their persistent in-flight record on an unknown outcome.
+    // Unknown inputs are never replayed. Their bounded reservation expires independently;
+    // actual conversation activity remains observable after this view disconnects.
     this.emit("close", code, Buffer.from(reason));
   }
   terminate() {
@@ -195,18 +210,31 @@ export class WorkspaceSocket extends EventEmitter implements NativeSocket {
         const frame = JSON.parse(text) as Frame;
         if (frame.method === "initialize")
           this.initialization = frame.params as Record<string, unknown>;
-        if (frame.method !== "initialize" && frame.method !== "initialized") {
+        const setup =
+          frame.method === "initialize" || frame.method === "initialized";
+        if (
+          typeof frame.method === "string" &&
+          !setup &&
+          !READ_METHODS.has(frame.method)
+        ) {
           admission = await this.options.router.admit(
             this.options.runtimeId,
             this.options.workspaceId,
           );
           await this.connect(admission.target, true);
+        } else if (!setup && !this.pending.size) {
+          await this.connect(
+            await this.options.router.route(
+              this.options.runtimeId,
+              this.options.workspaceId,
+            ),
+            true,
+          );
         }
         if (this.ended || this.socket?.readyState !== WebSocket.OPEN)
           throw new Error("Workspace socket closed");
         const id = frame.id;
         if (
-          admission &&
           typeof frame.method === "string" &&
           (typeof id === "string" || typeof id === "number")
         ) {
@@ -230,8 +258,7 @@ export class WorkspaceSocket extends EventEmitter implements NativeSocket {
           ),
         );
         if (frame.method === "initialized") this.initialized = true;
-        if (admission && typeof frame.method !== "string")
-          await admission.complete();
+        if (admission && frame.id === undefined) await admission.complete();
         callback?.();
       } catch (error) {
         if (!sent)
@@ -335,7 +362,7 @@ export class WorkspaceSocket extends EventEmitter implements NativeSocket {
                 if (request.method === "thread/unsubscribe")
                   this.subscribed = false;
               }
-              await request.admission.complete();
+              await request.admission?.complete();
               this.pending.delete(id);
             }
           }
