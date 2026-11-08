@@ -49,10 +49,18 @@ export async function inspectWorkspace(
   options: { checkGoals?: boolean } = {},
 ): Promise<boolean> {
   for (const threadId of threadIds) {
-    const queue = (await client.request("thread/queue/list", {
-      threadId,
-      limit: 1,
-    })) as { data: unknown[] };
+    let queue: { data: unknown[] };
+    try {
+      queue = (await client.request("thread/queue/list", {
+        threadId,
+        limit: 1,
+      })) as { data: unknown[] };
+    } catch (error) {
+      // Native queue APIs reject archived sessions. Verify archive membership using the public
+      // listing API; never infer it from error text or hide a dependency failure.
+      if (await isArchived(client, threadId)) continue;
+      throw error;
+    }
     if (!Array.isArray(queue.data)) throw new Error("Invalid queue response");
     if (queue.data.length) return true;
     const result = (await client.request("thread/read", {
@@ -80,6 +88,39 @@ export async function inspectWorkspace(
       })) as { goal?: { status: string } | null };
       if (result.goal?.status === "active") return true;
     }
+  }
+  return false;
+}
+
+async function isArchived(
+  client: NativeRequester,
+  threadId: string,
+): Promise<boolean> {
+  const read = (await client.request("thread/read", {
+    threadId,
+    includeTurns: false,
+  })) as {
+    thread: { cwd?: string; status: { type: string } };
+  };
+  if (
+    read.thread?.status?.type !== "notLoaded" ||
+    typeof read.thread.cwd !== "string"
+  )
+    return false;
+  let cursor: string | undefined;
+  for (let page = 0; page < 16; page++) {
+    const listed = (await client.request("thread/list", {
+      archived: true,
+      cwd: read.thread.cwd,
+      modelProviders: [],
+      limit: 100,
+      ...(cursor ? { cursor } : {}),
+    })) as { data: { id: string }[]; nextCursor?: string | null };
+    if (!Array.isArray(listed.data))
+      throw new Error("Invalid archived thread list");
+    if (listed.data.some((thread) => thread.id === threadId)) return true;
+    if (!listed.nextCursor || listed.nextCursor === cursor) return false;
+    cursor = listed.nextCursor;
   }
   return false;
 }

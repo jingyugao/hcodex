@@ -660,6 +660,12 @@ test(
         RACE: 1,
       });
       assert.deepEqual(modelErrors, []);
+      await clientB.request("thread/archive", { threadId });
+      assert.equal(
+        await routerA.isActive(runtimeId, workspaceId),
+        false,
+        "an archived native session must not pin the old slot",
+      );
     } finally {
       releaseFirst?.();
       releaseOther?.();

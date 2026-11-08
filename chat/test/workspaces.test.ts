@@ -384,3 +384,23 @@ test("unloaded threads still check the persistent queue; terminal and goal activ
     true,
   );
 });
+
+test("queue failures are ignored only after native archive membership is verified", async () => {
+  const failure = new Error("queue unavailable");
+  let archived = true;
+  const client = {
+    async request(method: string, params?: Record<string, unknown>) {
+      if (method === "thread/queue/list") throw failure;
+      if (method === "thread/read")
+        return { thread: { cwd: "/workspace", status: { type: "notLoaded" } } };
+      if (method === "thread/list") {
+        assert.equal(params?.archived, true);
+        return { data: archived ? [{ id: "archived" }] : [], nextCursor: null };
+      }
+      throw new Error("unexpected request");
+    },
+  };
+  assert.equal(await inspectWorkspace(client, ["archived"]), false);
+  archived = false;
+  await assert.rejects(inspectWorkspace(client, ["archived"]), failure);
+});
