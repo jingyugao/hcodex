@@ -101,4 +101,4 @@ jobs:
           gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "hcodex $tag (Linux x86_64, glibc)" \
             --notes "Built from $GITHUB_SHA; see build-info.json in the archive for the codex commit." \
-            dist/hcodex-linux-x64.tar.gz dist/SHA256SUMS
+            dist/hcodex-linux-x64.tar.gz dist/hcodex-chat-*.tgz dist/SHA256SUMS
