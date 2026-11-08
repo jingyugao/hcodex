@@ -9,6 +9,7 @@
  *   {@link createGateway}.
  */
 export * from "./types.js";
+export { withoutInputAuthor } from "./input.js";
 export {
   createConversationStore,
   type ConversationStore,

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { inputAuthor } from "../src/rules.ts";
+import { withoutInputAuthor } from "../src/input.ts";
 import { submitInput } from "../src/session.ts";
 import type { Conversation } from "../src/types.ts";
 
@@ -20,7 +21,7 @@ test("submitInput: the owner starts a turn, others queue and start the queue", a
       return { ok: method };
     },
   };
-  const params = (author: string) => ({ threadId: "thr-1", input: [{ type: "text", text: "hi" }], hcodex: { authorUserId: author, env: { USER_ID: author } } });
+  const params = (author: string) => ({ threadId: "thr-1", input: [{ type: "text", text: "hi" }], hcodex: { authorUserId: author, authorName: author === owner ? "Owner" : "Other", env: { USER_ID: author } } });
 
   assert.deepEqual(
     await submitInput({ store, requester, conversationId: "conv-1", method: "turn/start", params: params(owner) }),
@@ -35,5 +36,10 @@ test("submitInput: the owner starts a turn, others queue and start the queue", a
   assert.equal(inputAuthor(queued.clientUserMessageId), other);
   assert.deepEqual(queued.responsesapiClientMetadata, { "fork.env.USER_ID": other });
   assert.equal("hcodex" in calls[0]![1], false);
+  for (const [index, name] of ["Owner", "Other"].entries()) {
+    const sent = calls[index]![1];
+    assert.deepEqual(withoutInputAuthor(sent.input, sent.clientUserMessageId), [{ type: "text", text: "hi" }]);
+    assert.ok(sent.input[0].text.includes(JSON.stringify({ userId: index === 0 ? owner : other, name })));
+  }
   assert.deepEqual(recorded, [owner, other]);
 });
