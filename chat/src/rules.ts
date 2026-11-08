@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 
+import { withInputAuthor } from "./input.js";
 import { ConversationConflict, InvalidRequest } from "./types.js";
+
+export { inputAuthor } from "./input.js";
 
 /** Metadata prefix the Codex fork turns into child-process environment variables. */
 export const FORK_ENV_PREFIX = "fork.env.";
@@ -15,6 +18,7 @@ const bytes = (value: string) => Buffer.byteLength(value, "utf8");
 /** The author of one input, supplied by the trusted host in `params.hcodex`. */
 export interface InputIdentity {
   authorUserId: string;
+  authorName: string;
   env: Record<string, string>;
 }
 
@@ -22,15 +26,6 @@ export interface InputIdentity {
 export function newInputId(userId: string): string {
   if (!UUID.test(userId)) throw new InvalidRequest("Invalid input author");
   return `${userId.toLowerCase()}:${randomUUID()}`;
-}
-
-/** Author of a native `userMessage.clientId` created by {@link newInputId}, if any. */
-export function inputAuthor(clientId: unknown): string | undefined {
-  if (typeof clientId !== "string") return;
-  const [userId, nonce, extra] = clientId.split(":");
-  return extra === undefined && nonce && userId && UUID.test(userId) && UUID.test(nonce)
-    ? userId.toLowerCase()
-    : undefined;
 }
 
 /** `responsesapiClientMetadata` carrying the author's complete env as `fork.env.*`. */
@@ -53,12 +48,13 @@ export function encodeInputEnv(env: Record<string, string>): Record<string, stri
 /** Reads and validates the host's `params.hcodex` identity. */
 export function inputIdentity(value: unknown): InputIdentity {
   const identity = value as Partial<InputIdentity> | undefined;
-  if (!identity || typeof identity !== "object" || typeof identity.authorUserId !== "string")
-    throw new InvalidRequest("Input identity (params.hcodex) required");
+  if (!identity || typeof identity !== "object" || typeof identity.authorUserId !== "string" ||
+    typeof identity.authorName !== "string")
+    throw new InvalidRequest("Input identity (params.hcodex) requires authorUserId and authorName");
   const env = identity.env ?? {};
   if (typeof env !== "object" || Array.isArray(env))
     throw new InvalidRequest("Input env must be an object");
-  return { authorUserId: identity.authorUserId, env: env as Record<string, string> };
+  return { authorUserId: identity.authorUserId, authorName: identity.authorName, env: env as Record<string, string> };
 }
 
 export type InputMethod = "turn/start" | "turn/steer" | "thread/queue/add";
@@ -88,10 +84,13 @@ export function planInput(
   const owner = conversation.ownerId === identity.authorUserId;
   if (method === "turn/steer" && !owner)
     throw new ConversationConflict("Only the conversation owner can steer");
+  if (!Array.isArray(params.input) || params.input.length === 0)
+    throw new InvalidRequest("Input must be a non-empty array");
   const inputId = newInputId(identity.authorUserId);
   const { hcodex: _identity, clientUserMessageId: _clientId, responsesapiClientMetadata: _metadata, ...rest } = params;
   const next: Record<string, unknown> = {
     ...rest,
+    input: withInputAuthor(params.input, { userId: identity.authorUserId, name: identity.authorName }),
     clientUserMessageId: inputId,
     responsesapiClientMetadata: encodeInputEnv(identity.env),
   };

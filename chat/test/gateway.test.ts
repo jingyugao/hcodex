@@ -8,6 +8,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { createGateway, UPSTREAM_CLOSED } from "../src/gateway.ts";
 import { createReplicaResolver } from "../src/routing.ts";
 import { inputAuthor } from "../src/rules.ts";
+import { withoutInputAuthor } from "../src/input.ts";
 import type { Conversation } from "../src/types.ts";
 
 const owner = "11111111-1111-4111-8111-111111111111";
@@ -79,7 +80,7 @@ const input = (id: number, method: string, author: string) =>
   JSON.stringify({
     id,
     method,
-    params: { threadId: "thr-1", input: [{ type: "text", text: "hi" }], hcodex: { authorUserId: author, env: { TOKEN: author } } },
+    params: { threadId: "thr-1", input: [{ type: "text", text: "hi" }], hcodex: { authorUserId: author, authorName: author === owner ? "Owner" : "Other", env: { TOKEN: author } } },
   });
 
 test("applies the send rules and keeps the gateway's own requests to itself", async () => {
@@ -93,12 +94,15 @@ test("applies the send rules and keeps the gateway's own requests to itself", as
   assert.equal(inputAuthor(start.params.clientUserMessageId), owner);
   assert.deepEqual(start.params.responsesapiClientMetadata, { "fork.env.TOKEN": owner });
   assert.equal("hcodex" in start.params, false);
+  assert.ok(start.params.input[0].text.includes(JSON.stringify({ userId: owner, name: "Owner" })));
+  assert.deepEqual(withoutInputAuthor(start.params.input, start.params.clientUserMessageId), [{ type: "text", text: "hi" }]);
 
   client.send(input(2, "turn/start", other));
   assert.deepEqual(await next(), { id: 2, result: { queuedSubmission: { id: "q1" } } });
   await settle();
   const [queued, nudge] = upstreamFrames.slice(-2);
   assert.equal(queued!.method, "thread/queue/add");
+  assert.ok(queued!.params.input[0].text.includes(JSON.stringify({ userId: other, name: "Other" })));
   assert.equal(nudge!.method, "thread/queue/start");
   assert.deepEqual(nudge!.params, { threadId: "thr-1" });
 

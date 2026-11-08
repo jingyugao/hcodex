@@ -11,6 +11,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./input": {
+      "types": "./dist/input.d.ts",
+      "default": "./dist/input.js"
     }
   },
   "files": [

@@ -27,9 +27,9 @@ const requestId = (value: unknown): value is string | number =>
  * Applies the send rule to one client connection of one conversation, frame by frame, for hosts
  * that relay the native protocol themselves. Feed client frames in arrival order, one at a time.
  *
- * - `turn/start` / `turn/steer` carry the author in `params.hcodex = {authorUserId, env}`: the
+ * - `turn/start` / `turn/steer` carry `params.hcodex = {authorUserId, authorName, env}`: the
  *   owner starts or steers, others queue (`thread/queue/add`, then `thread/queue/start`). The
- *   input gets a `<author>:<uuid>` ID and the env becomes `fork.env.*` metadata.
+ *   input gets a model-visible author context, a `<author>:<uuid>` ID and `fork.env.*` env metadata.
  * - Other frames pass through without `params.hcodex`.
  * - Accepted inputs record the author as a participant; failures are logged, never retried.
  */
@@ -102,7 +102,7 @@ export async function submitInput(options: {
   requester: NativeRequester;
   conversationId: string;
   method: "turn/start" | "turn/steer";
-  /** Native params plus `hcodex: {authorUserId, env}`. */
+  /** Unwrapped native input plus `hcodex: {authorUserId, authorName, env}`. */
   params: Record<string, unknown>;
   log?: Log;
 }): Promise<unknown> {
