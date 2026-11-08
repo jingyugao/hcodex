@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Builds the hcodex Linux x86_64 (glibc) package and optionally publishes it as a GitHub Release.
+# Builds the hcodex release and optionally publishes it as a GitHub Release.
 #
 #   scripts/release.sh                 # build and package into target/dist
 #   scripts/release.sh --publish v0.1.0
 #
-# The package is hcodex's codex-app-server plus upstream's codex-exec-server and
-# codex-code-mode-host from the pinned codex commit (codex.rev, checked out or symlinked at
-# ./codex). Binaries sit at the archive root, so the extracted directory can be Colony's
-# `codex-artifacts` build context. Build on Ubuntu 24.04 (glibc 2.39), the runtime image's base.
+# - hcodex-linux-x64.tar.gz: hcodex's codex-app-server plus upstream's codex-exec-server and
+#   codex-code-mode-host from the pinned codex commit (codex.rev, checked out or symlinked at
+#   ./codex). Binaries sit at the archive root, so the extracted directory can be Colony's
+#   `codex-artifacts` build context. Build on Ubuntu 24.04 (glibc 2.39), the runtime image's base.
+# - hcodex-chat-<version>.tgz: the chat SDK as an npm package, installable from the release URL.
 #
 # Publishing tags the current commit, which must be pushed; the tag then triggers CI as an
 # after-the-fact check.
@@ -19,7 +20,7 @@ publish=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --publish) publish="${2:?--publish needs a tag}"; shift 2 ;;
-    -h | --help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -87,7 +88,19 @@ jq -n --arg commit "$commit" --arg codex "$rev" --arg builtOn "$built_on" --argj
     codexCommit:$codex,target:"x86_64-unknown-linux-gnu",builtOn:$builtOn,rust:$rust,
     profile:"release"}' > "$package/build-info.json"
 tar -czf "$dist/hcodex-linux-x64.tar.gz" -C "$package" .
-(cd "$dist" && sha256sum hcodex-linux-x64.tar.gz > SHA256SUMS)
+
+# Build the SDK in its checkout, then package compiled artifacts with the release version.
+log "packing the chat SDK"
+version="${publish#v}"
+[[ -n $version ]] || version="0.0.0-${commit:0:7}"
+sdk="$CARGO_TARGET_DIR/package/chat"
+rm -rf "$sdk"
+mkdir -p "$sdk"
+(cd chat && npm ci --no-audit --no-fund --loglevel=error && npm run build)
+cp -r chat/dist chat/sql "$sdk/"
+jq --arg version "$version" '.version = $version' chat/package.json > "$sdk/package.json"
+(cd "$sdk" && npm pack --ignore-scripts --pack-destination "$dist" --loglevel=error > /dev/null)
+(cd "$dist" && sha256sum hcodex-linux-x64.tar.gz "hcodex-chat-$version.tgz" > SHA256SUMS)
 
 log "smoke test"
 for binary in "${binaries[@]}"; do
@@ -103,4 +116,4 @@ log "publishing $publish"
 gh release create "$publish" -R jingyugao/hcodex --target "$commit" \
   --title "hcodex $publish (Linux x86_64, glibc)" \
   --notes "Built from $commit on $built_on; see build-info.json in the archive for the codex commit." \
-  "$dist/hcodex-linux-x64.tar.gz" "$dist/SHA256SUMS"
+  "$dist/hcodex-linux-x64.tar.gz" "$dist/hcodex-chat-$version.tgz" "$dist/SHA256SUMS"

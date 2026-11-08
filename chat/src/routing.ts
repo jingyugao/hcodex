@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { promises as dns } from "node:dns";
 import { isIP } from "node:net";
 
+export { createWorkspaceRouter, type WorkspaceRouter } from "./workspaces.js";
+
 /** Highest-random-weight choice: adding or removing a replica only moves the keys it wins or held. */
 export function rendezvous(key: string, replicas: readonly string[]): string | undefined {
   let best: string | undefined;

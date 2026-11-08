@@ -63,23 +63,24 @@ async fn sigterm_hands_off_running_turn_to_next_server_with_its_env() -> Result<
     Ok(())
 }
 
-/// Production shape: pods share only Postgres, and neither keeps conversation files.
+/// Production shape: pods share only Postgres and use the same CODEX_HOME path, each starting
+/// with it empty, and neither keeps conversation files.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_pods_hand_off_without_local_conversation_files() -> Result<()> {
     let Ok(url) = std::env::var("HCODEX_PG_TEST_URL") else {
         eprintln!("skipping: HCODEX_PG_TEST_URL is not set");
         return Ok(());
     };
-    let (home_a, home_b) = (TempDir::new()?, TempDir::new()?);
-    run_handoff(home_a.path(), home_b.path(), &url, Some(&url)).await?;
-    for home in [home_a.path(), home_b.path()] {
-        let files = conversation_files(home)?;
-        assert!(
-            files.is_empty(),
-            "conversation files under {}: {files:?}",
-            home.display()
-        );
-    }
+    let root = TempDir::new()?;
+    let home = root.path().join("codex-home");
+    std::fs::create_dir_all(&home)?;
+    run_handoff(&home, &home, &url, Some(&url)).await?;
+    let files = conversation_files(&home)?;
+    assert!(
+        files.is_empty(),
+        "conversation files under {}: {files:?}",
+        home.display()
+    );
     Ok(())
 }
 
@@ -109,9 +110,7 @@ async fn run_handoff(
     ]);
     mount(&server, 2, echo, Duration::ZERO).await;
     mount(&server, 3, final_message("recovered"), Duration::ZERO).await;
-    for home in [home_a, home_b] {
-        write_config(home, &server.uri())?;
-    }
+    write_config(home_a, &server.uri())?;
 
     let (mut pod_a, addr) = spawn_server(home_a, store, thread_store, "pod-a").await?;
     let mut ws = connect(addr).await?;
@@ -158,6 +157,12 @@ async fn run_handoff(
         .await
         .context("pod A did not exit after handing off")??;
     assert!(status.success(), "pod A exit: {status}");
+    if home_b == home_a && thread_store.is_some() {
+        // A new pod starts with an empty CODEX_HOME at the same path.
+        std::fs::remove_dir_all(home_b)?;
+        std::fs::create_dir_all(home_b)?;
+    }
+    write_config(home_b, &server.uri())?;
 
     let (_pod_b, addr) = spawn_server(home_b, store, thread_store, "pod-b").await?;
     let mut ws = connect(addr).await?;
@@ -179,6 +184,15 @@ async fn run_handoff(
 
     let bodies = response_bodies(&server).await?;
     assert_eq!(bodies.len(), 3, "one source and two recovered requests");
+    // Recovery must resend the interrupted request's input unchanged: no context is re-injected
+    // when pods share the CODEX_HOME path, and replaying model output depends on it.
+    let input =
+        |body: &str| -> Result<Value> { Ok(serde_json::from_str::<Value>(body)?["input"].clone()) };
+    assert_eq!(
+        input(&bodies[1])?,
+        input(&bodies[0])?,
+        "recovered request input changed"
+    );
     assert!(
         bodies[2].contains("fork-env=trace-123"),
         "recovered exec output should carry the per-turn env"

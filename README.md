@@ -144,15 +144,29 @@ thread/start    {…, environments:[{environmentId:"sbx-<id>", cwd:"/workspace"}
 
 ## 多人聊天层（`chat/`）
 
-一个无状态、可多副本的 Node 服务，同一端口（默认 4910）提供：
+TypeScript SDK（`@hcodex/chat`），在宿主进程里使用；是否独立部署由宿主决定。随 release 发布为 `hcodex-chat-<版本>.tgz`，可直接用 release 地址安装：
 
-- **对话 API**（HTTP JSON，`Authorization: Bearer $HCODEX_CHAT_HOST_TOKEN`）：对话、参与者、外部来源映射、按 ID 批量查询，以及查看者的对话列表（筛选、按最后活动时间分页、参与人数，join 在 PG 里完成）。路由见 `chat/src/http.ts`。
-  - 可见性只有一条：查看者参与过的对话（创建人自动是参与者）；`GET /v1/conversations/{id}/participants/{userId}` 判断单个对话（不是参与者时 404）。群、组织等视图由宿主用自己的映射查出对话 ID，再批量取；宿主负责这类授权。
-  - `metadata`：宿主自有的展示数据（如 tag），JSON 对象，最大 16KB；创建和 `PATCH` 时整体写入，原样返回，不支持查询。
-- **网关**（WebSocket `/v1/native`，原生 app-server 协议）：宿主带上 `X-Hcodex-Conversation`、`X-Hcodex-Upstream`（app-server 副本池，headless Service 地址）和可选的 `X-Hcodex-Upstream-Headers`（JSON）连接。`turn/start` / `turn/steer` 的 params 里由宿主附上 `hcodex: {authorUserId, env}`，网关按对话的发起人改写：发起人 `turn/start` / `turn/steer`，其他人 `thread/queue/add` 后自动 `thread/queue/start`；生成 `clientUserMessageId = <作者>:<uuid>`；env 编码为 `fork.env.*`；输入被接受后记录参与者和最后活动时间。其他帧原样转发。
-- **路由**：按对话 ID 在副本池（DNS 每 5 秒刷新）中做 rendezvous hash；上游断开时以关闭码 4502 关闭下游，不重放输入。
+```sh
+pnpm add https://github.com/jingyugao/hcodex/releases/download/v0.1.0/hcodex-chat-0.1.0.tgz
+```
 
-配置：`HCODEX_CHAT_HOST_TOKEN`、`HCODEX_CHAT_STORE`（`postgres://…`，表在首次启动时创建）、`HCODEX_CHAT_LISTEN`（默认 `0.0.0.0:4910`）、`HCODEX_CHAT_DRAIN_SECS`（SIGTERM 后先返回 503 再关闭连接，默认 5）。镜像：`docker build -t hcodex-chat chat`。
+| 导出 | 用途 |
+|---|---|
+| `createConversationStore(pool)` | PG 存储：对话、参与者、外部来源映射；`migrate()` 建表（advisory lock，多副本可并发调用） |
+| `createInputSession({store, conversationId})` | 宿主自己转发原生协议时，逐帧应用发送规则（`fromClient` / `fromUpstream`） |
+| `submitInput({store, requester, …})` | 宿主作为 JSON-RPC 客户端调用 app-server 时（机器人、Job）应用发送规则 |
+| `createWorkspaceRouter(pool, {inspect})` | PG 保存 workspace 路由；检查活跃状态、关闭发送入口、排空请求并切换目标 |
+| `WorkspaceSocket`、`createWorkspaceTransport` | 所有原生请求经过 workspace admission；切换后重连订阅，不重发结果未知的输入 |
+| `replicaUrl(resolver, poolUrl, conversationId)`、`createReplicaResolver()` | 选对话所在的 app-server 副本 |
+| `createHttpApi`、`createGateway` | 独立部署时的现成组件：宿主 HTTP API 和 `/v1/native` 网关 |
+
+规则：
+
+- **可见性**只有一条：查看者参与过的对话（创建人自动是参与者）；`getParticipant` 判断单个对话。群、组织等视图由宿主用自己的映射查出对话 ID，再 `getMany`；宿主负责这类授权。
+- **`metadata`**：宿主自有的展示数据（如 tag），JSON 对象，最大 16KB；整体写入，原样返回，不支持查询。
+- **发送规则**：`turn/start` / `turn/steer` 的 params 里由宿主附上 `hcodex: {authorUserId, env}`。发起人 `turn/start` / `turn/steer`，其他人 `thread/queue/add` 后自动 `thread/queue/start`；`clientUserMessageId = <作者>:<uuid>`；env 编码为 `fork.env.*`；输入被接受后记录参与者和最后活动时间。
+- **Workspace 路由**：同一 workspace 的浏览器、机器人和 Job 必须使用 `WorkspaceSocket` 或 `createWorkspaceTransport`，由 PG 固定到同一 app-server。切换先检查 turn、持久队列和后台终端，再关闭 admission、等待已发送请求、复查并更新路由。宿主关闭 goals 和子 agent；启用 goals 时检查器必须传 `checkGoals: true`。目标必须是新进程；曾持有该 workspace 的进程退出后才能复用槽位。未知结果会阻止自动切换，只有确定响应或宿主证明原进程已退出后才能清理。切换通知 `hcodex/workspaceMoved` 让宿主补读历史。
+- **独立网关**：`createGateway` 保留按对话 ID 和 DNS 副本池选择目标的原有行为，不参与 workspace 发布；断开时以 4502 关闭下游，不重放输入。
 
 ```sh
 cd chat && npm ci && npm run typecheck

@@ -22,7 +22,7 @@ jobs:
         image: postgres:16-alpine
         env:
           POSTGRES_PASSWORD: hcodex
-          POSTGRES_DB: hcodex
+          POSTGRES_DB: hcodex_github_ci
         ports: ['5432:5432']
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s
@@ -32,7 +32,7 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      HCODEX_PG_TEST_URL: postgres://postgres:hcodex@127.0.0.1:5432/hcodex
+      HCODEX_PG_TEST_URL: postgres://postgres:hcodex@127.0.0.1:5432/hcodex_github_ci
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -101,6 +101,17 @@ jobs:
       - name: Test
         run: cargo test -p hcodex-pg -p hcodex-ha
 
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '22'
+      - name: Verify workspace migration against real app servers
+        working-directory: chat
+        env:
+          HCODEX_APP_SERVER_BINARY: ${{ github.workspace }}/target/debug/codex-app-server
+        run: |
+          npm ci --no-audit --no-fund
+          node --import tsx --test test/workspace-e2e.test.ts
+
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -122,7 +133,7 @@ jobs:
         image: postgres:16-alpine
         env:
           POSTGRES_PASSWORD: hcodex
-          POSTGRES_DB: hcodex
+          POSTGRES_DB: hcodex_github_ci
         ports: ['5432:5432']
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s
@@ -131,7 +142,7 @@ jobs:
       run:
         working-directory: chat
     env:
-      HCODEX_PG_TEST_URL: postgres://postgres:hcodex@127.0.0.1:5432/hcodex
+      HCODEX_PG_TEST_URL: postgres://postgres:hcodex@127.0.0.1:5432/hcodex_github_ci
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -144,6 +155,5 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
       - run: npm test
-      - name: Build the image
-        working-directory: chat
-        run: docker build -t hcodex-chat:ci .
+      - name: Pack the SDK
+        run: npm pack --dry-run

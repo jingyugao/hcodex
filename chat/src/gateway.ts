@@ -1,32 +1,18 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 
 import { replicaUrl, type ReplicaResolver } from "./routing.js";
-import { inputIdentity, planInput } from "./rules.js";
-import type { Conversation } from "./types.js";
-
-/** The store operations the gateway needs. */
-export interface GatewayStore {
-  get(id: string): Promise<Conversation | undefined>;
-  recordInput(conversationId: string, userId: string): Promise<void>;
-}
-
-export type Log = (event: string, fields?: Record<string, unknown>) => void;
+import { createInputSession, type Frame, type InputStore, type Log } from "./session.js";
 
 /** Close code sent downstream when the app-server connection ends: reconnect to continue. */
 export const UPSTREAM_CLOSED = 4502;
-const INTERNAL_ID = "hcodex:";
-const MAX_PENDING_INPUTS = 256;
 const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 
-type Frame = Record<string, unknown> & { id?: unknown; method?: unknown; params?: unknown };
 const isObject = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
-const requestId = (value: unknown): value is string | number =>
-  typeof value === "string" || typeof value === "number";
 
 function parse(data: RawData): Frame | undefined {
   try {
@@ -63,9 +49,13 @@ function openUpstream(url: string, headers: Record<string, string>, maxPayload: 
   });
 }
 
-/** Native-protocol proxy between trusted hosts and app-server replicas. */
+/**
+ * Standalone native-protocol proxy between trusted hosts and app-server replicas, for hosts that
+ * run hcodex chat as its own service. Hosts relaying connections themselves use
+ * {@link createInputSession} instead.
+ */
 export function createGateway(options: {
-  store: GatewayStore;
+  store: InputStore;
   resolver: ReplicaResolver;
   hostToken: string;
   maxPayload?: number;
@@ -100,14 +90,10 @@ export function createGateway(options: {
   heartbeat.unref();
 
   function relay(client: WebSocket, upstream: WebSocket, conversationId: string) {
-    /** Inputs awaiting their native response: request ID → author and follow-up. */
-    const pending = new Map<string | number, { author: string; threadId: unknown; startQueue: boolean }>();
+    const session = createInputSession({ store, conversationId, log });
     let chain = Promise.resolve();
-    const toClient = (frame: Frame) => {
-      if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(frame));
-    };
-    const toUpstream = (frame: Frame) => {
-      if (upstream.readyState === WebSocket.OPEN) upstream.send(JSON.stringify(frame));
+    const send = (socket: WebSocket, frame: Frame | undefined) => {
+      if (frame && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
     };
 
     async function fromClient(data: RawData, binary: boolean) {
@@ -116,49 +102,16 @@ export function createGateway(options: {
         if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary });
         return;
       }
-      const params = isObject(frame.params) ? frame.params : undefined;
-      const method = frame.method;
-      if ((method === "turn/start" || method === "turn/steer") && requestId(frame.id) && params) {
-        try {
-          if (pending.size >= MAX_PENDING_INPUTS || pending.has(frame.id))
-            throw new Error("Too many pending inputs or duplicate request ID");
-          const conversation = await store.get(conversationId);
-          if (!conversation) throw new Error("Conversation not found");
-          const identity = inputIdentity(params.hcodex);
-          const plan = planInput(conversation, method, params, identity);
-          pending.set(frame.id, { author: identity.authorUserId, threadId: plan.params.threadId, startQueue: plan.startQueue });
-          toUpstream({ ...frame, method: plan.method, params: plan.params });
-        } catch (error) {
-          toClient({ id: frame.id, error: { code: -32600, message: (error as Error).message } });
-        }
-        return;
-      }
-      // Identity and env are for this gateway only.
-      if (params && "hcodex" in params) {
-        const { hcodex: _identity, ...rest } = params;
-        frame.params = rest;
-      }
-      toUpstream(frame);
+      const out = await session.fromClient(frame);
+      send(upstream, out.upstream);
+      send(client, out.client);
     }
 
     function fromUpstream(data: RawData, binary: boolean) {
       const frame = binary ? undefined : parse(data);
-      if (frame && frame.method === undefined && requestId(frame.id)) {
-        if (typeof frame.id === "string" && frame.id.startsWith(INTERNAL_ID)) return;
-        const input = pending.get(frame.id);
-        if (input) {
-          pending.delete(frame.id);
-          if (!("error" in frame)) {
-            store
-              .recordInput(conversationId, input.author)
-              .catch((error: unknown) => log("record_input_failed", { conversationId, error: String(error) }));
-            // Rejected while a turn is active; only needed when the thread is idle.
-            if (input.startQueue)
-              toUpstream({ id: `${INTERNAL_ID}${randomUUID()}`, method: "thread/queue/start", params: { threadId: input.threadId } });
-          }
-        }
-      }
-      if (client.readyState === WebSocket.OPEN) client.send(data, { binary });
+      const out = frame ? session.fromUpstream(frame) : { forward: true };
+      send(upstream, out.upstream);
+      if (out.forward && client.readyState === WebSocket.OPEN) client.send(data, { binary });
     }
 
     client.on("message", (data, binary) => {
@@ -184,11 +137,13 @@ export function createGateway(options: {
       if (!sameToken(request.headers.authorization, hostToken)) return reject(socket, 401, "Unauthorized");
       const conversationId = request.headers["x-hcodex-conversation"];
       const pool = request.headers["x-hcodex-upstream"];
-      if (typeof conversationId !== "string" || !conversationId || typeof pool !== "string" || !pool)
+      if (typeof conversationId !== "string" || !conversationId ||
+          (typeof pool !== "string" || !pool))
         return reject(socket, 400, "Bad Request");
       let upstream: WebSocket;
       try {
-        if (!(await store.get(conversationId))) return reject(socket, 404, "Not Found");
+        const conversation = await store.get(conversationId);
+        if (!conversation) return reject(socket, 404, "Not Found");
         const headers = upstreamHeaders(request.headers["x-hcodex-upstream-headers"]);
         const url = await replicaUrl(resolver, pool, conversationId);
         upstream = await openUpstream(url, headers, maxPayload);

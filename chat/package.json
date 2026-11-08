@@ -1,15 +1,27 @@
 {
   "name": "@hcodex/chat",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
-  "description": "hcodex multi-user chat layer: conversations, participants, send rules and the native-protocol gateway",
+  "description": "hcodex chat SDK: multi-user conversations, send rules and routing for Codex app-server",
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "sql"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
-    "start": "node dist/main.js"
+    "prepack": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "pg": "^8.16.3",
