@@ -313,11 +313,14 @@ test(
       await once(model, "listening");
       const address = model.address();
       assert.ok(address && typeof address !== "string");
+      const connectionConfig = {
+        "model_providers.mock_provider.base_url": `http://127.0.0.1:${address.port}/v1`,
+      };
       await mkdir(home, { recursive: true });
       await mkdir(workspace, { recursive: true });
       await writeFile(
         join(home, "config.toml"),
-        `model = "mock-model"\nmodel_provider = "mock_provider"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n[features]\nenable_request_compression = false\nmulti_agent = false\nmulti_agent_v2 = false\ngoals = false\napps = false\nmemories = false\n[model_providers.mock_provider]\nname = "Isolated workspace integration model"\nbase_url = "http://127.0.0.1:${address.port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n`,
+        `model = "mock-model"\nmodel_provider = "mock_provider"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n[features]\nenable_request_compression = false\nmulti_agent = false\nmulti_agent_v2 = false\ngoals = false\napps = false\nmemories = false\n[model_providers.mock_provider]\nname = "Isolated workspace integration model"\nbase_url = "http://127.0.0.1:1/missing-connection-context"\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n`,
       );
       async function launch(owner: string): Promise<string> {
         const sqlite = join(root, `sqlite-${owner}`);
@@ -420,6 +423,7 @@ test(
       }
       const clientA = await virtual(routerA);
       const started = await clientA.request("thread/start", {
+        config: connectionConfig,
         cwd: workspace,
         model: "mock-model",
         approvalPolicy: "never",
@@ -428,7 +432,11 @@ test(
       const threadId: string = started.thread.id;
       assert.equal((await store.get(conversationId))?.threadId, threadId);
       const clientB = await virtual(routerB);
-      await clientB.request("thread/resume", { threadId, excludeTurns: true });
+      await clientB.request("thread/resume", {
+        threadId,
+        excludeTurns: true,
+        config: connectionConfig,
+      });
       // Keep a separate workspace executing on A while the tested workspace moves to B.
       const otherWorkspaceId = randomUUID(),
         otherConversationId = randomUUID();
@@ -449,6 +457,7 @@ test(
         otherWorkspaceId,
       );
       const otherStarted = await otherClient.request("thread/start", {
+        config: connectionConfig,
         cwd: otherWorkspace,
         model: "mock-model",
         approvalPolicy: "never",

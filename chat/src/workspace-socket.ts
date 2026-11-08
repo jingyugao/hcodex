@@ -55,13 +55,18 @@ export class WorkspaceSocket extends EventEmitter implements NativeSocket {
   private outgoing = Promise.resolve();
   private incoming = Promise.resolve();
   private initialization?: Record<string, unknown>;
+  private resumeParams: Record<string, unknown> = {};
   private subscribed = false;
   private initialized = false;
   private checking = false;
   private readonly refresh: ReturnType<typeof setInterval>;
   private readonly pending = new Map<
     string | number,
-    { admission: WorkspaceAdmission; method: string }
+    {
+      admission: WorkspaceAdmission;
+      method: string;
+      params?: Record<string, unknown>;
+    }
   >();
   private readonly internal = new Map<
     string,
@@ -207,7 +212,16 @@ export class WorkspaceSocket extends EventEmitter implements NativeSocket {
         ) {
           if (this.pending.has(id) || this.pending.size >= 256)
             throw new Error("Duplicate request ID or pending limit");
-          this.pending.set(id, { admission, method: frame.method });
+          this.pending.set(id, {
+            admission,
+            method: frame.method,
+            params:
+              frame.params &&
+              typeof frame.params === "object" &&
+              !Array.isArray(frame.params)
+                ? (frame.params as Record<string, unknown>)
+                : undefined,
+          });
         }
         sent = true;
         await new Promise<void>((resolve, reject) =>
@@ -221,13 +235,11 @@ export class WorkspaceSocket extends EventEmitter implements NativeSocket {
         callback?.();
       } catch (error) {
         if (!sent)
-          await admission
-            ?.complete()
-            .catch((e) =>
-              this.options.log?.("inflight_cleanup_failed", {
-                error: String(e),
-              }),
-            );
+          await admission?.complete().catch((e) =>
+            this.options.log?.("inflight_cleanup_failed", {
+              error: String(e),
+            }),
+          );
         callback?.(error instanceof Error ? error : new Error(String(error)));
         this.emit("error", error);
         this.terminate();
@@ -301,8 +313,25 @@ export class WorkspaceSocket extends EventEmitter implements NativeSocket {
                 if (
                   request.method === "thread/start" ||
                   request.method === "thread/resume"
-                )
+                ) {
                   this.subscribed = true;
+                  if (request.method === "thread/start") this.resumeParams = {};
+                  // Reapply the host's connection context on a cold owner. PG retains model
+                  // selection; explicit old model overrides must not reset later turn changes.
+                  for (const key of [
+                    "config",
+                    "cwd",
+                    "runtimeWorkspaceRoots",
+                    "approvalPolicy",
+                    "approvalsReviewer",
+                    "sandbox",
+                    "permissions",
+                    "baseInstructions",
+                    "developerInstructions",
+                  ])
+                    if (request.params && Object.hasOwn(request.params, key))
+                      this.resumeParams[key] = request.params[key];
+                }
                 if (request.method === "thread/unsubscribe")
                   this.subscribed = false;
               }
@@ -351,7 +380,11 @@ export class WorkspaceSocket extends EventEmitter implements NativeSocket {
       socket.send(JSON.stringify({ method: "initialized" }));
       const threadId = await this.options.threadId();
       if (threadId && this.subscribed)
-        await this.setup("thread/resume", { threadId, excludeTurns: true });
+        await this.setup("thread/resume", {
+          ...this.resumeParams,
+          threadId,
+          excludeTurns: true,
+        });
       this.emit("reconnected", target);
       if (threadId)
         this.emit(
