@@ -6,8 +6,14 @@ use std::sync::Arc;
 
 use codex_protocol::ContextWindowId;
 use codex_protocol::ThreadId;
+use codex_protocol::items::CommandExecutionItem;
+use codex_protocol::items::CommandExecutionStatus;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
@@ -31,6 +37,7 @@ use codex_thread_store::ThreadSortKey;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateThreadMetadataParams;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use hcodex_pg::HandoffRecord;
 use hcodex_pg::PgHandoffStore;
 use hcodex_pg::PgQueueStore;
@@ -45,8 +52,52 @@ const TEST_URL_ENV: &str = "HCODEX_PG_TEST_URL";
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), BoxError>;
 
+struct TestSchema {
+    url: String,
+    base: String,
+    schema: String,
+}
+
+impl std::ops::Deref for TestSchema {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.url
+    }
+}
+
+impl Drop for TestSchema {
+    fn drop(&mut self) {
+        // Drop cannot await. Run cleanup on a separate runtime and wait for it, including
+        // when a test returns an error or panics. A killed test process still needs manual cleanup.
+        let base = self.base.clone();
+        let schema = self.schema.clone();
+        let cleanup = std::thread::spawn(move || -> Result<(), BoxError> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let pool = hcodex_pg::connect_lazy(&base)?;
+                sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+                    .execute(&pool)
+                    .await?;
+                pool.close().await;
+                Ok(())
+            })
+        })
+        .join();
+        if let Err(error) = cleanup.unwrap_or_else(|_| Err("schema cleanup thread panicked".into()))
+        {
+            eprintln!("test schema cleanup failed: {error}");
+            if !std::thread::panicking() {
+                panic!("test schema cleanup failed");
+            }
+        }
+    }
+}
+
 /// Creates a unique schema and returns a URL whose connections use it.
-async fn schema_url() -> Result<Option<String>, BoxError> {
+async fn schema_url() -> Result<Option<TestSchema>, BoxError> {
     let Ok(base) = std::env::var(TEST_URL_ENV) else {
         eprintln!("skipping: {TEST_URL_ENV} is not set");
         return Ok(None);
@@ -58,9 +109,11 @@ async fn schema_url() -> Result<Option<String>, BoxError> {
         .await?;
     pool.close().await;
     let separator = if base.contains('?') { '&' } else { '?' };
-    Ok(Some(format!(
-        "{base}{separator}options[search_path]={schema}"
-    )))
+    Ok(Some(TestSchema {
+        url: format!("{base}{separator}options[search_path]={schema}"),
+        base,
+        schema,
+    }))
 }
 
 fn store(url: &str, owner: &str) -> Result<PgThreadStore, ThreadStoreError> {
@@ -114,6 +167,99 @@ fn resume_params(thread_id: ThreadId) -> ResumeThreadParams {
         include_archived: false,
         metadata: metadata(),
     }
+}
+
+#[tokio::test]
+async fn legacy_completed_commands_survive_owner_handoff_with_bounded_output() -> TestResult {
+    let Some(url) = schema_url().await? else {
+        return Ok(());
+    };
+    let pod_a = store(&url, "pod-a")?;
+    let pod_b = store(&url, "pod-b")?;
+    let thread_id = ThreadId::new();
+    pod_a.create_thread(create_params(thread_id, None)).await?;
+    let cwd: codex_utils_absolute_path::AbsolutePathBuf = AbsolutePathBuf::try_from("/tmp")?;
+    let completed = |id: &str, output: String| {
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id,
+            turn_id: "turn-1".into(),
+            item: TurnItem::CommandExecution(CommandExecutionItem {
+                sandbox_type: None,
+                model_context: None,
+                id: id.into(),
+                plugin_id: None,
+                script_path: None,
+                process_id: None,
+                command: vec!["echo".into(), "hello".into()],
+                cwd: cwd.clone().into(),
+                parsed_cmd: Vec::new(),
+                source: ExecCommandSource::Agent,
+                interaction_input: None,
+                status: CommandExecutionStatus::Completed,
+                aggregated_output: Some(output),
+                exit_code: Some(7),
+                duration: None,
+            }),
+            started_at_ms: Some(10),
+            completed_at_ms: 20,
+            content_token_count: None,
+        }))
+    };
+    pod_a
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                completed("short", "hello\n".into()),
+                message("user", "between commands")?,
+                completed("large", format!("START{}END", "x".repeat(128 * 1024))),
+            ],
+        })
+        .await?;
+    let history = pod_b.resume_thread(resume_params(thread_id)).await?;
+    let commands: Vec<_> = history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match &event.item {
+                TurnItem::CommandExecution(command) => Some(command),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(commands.len(), 2);
+    let short = history.iter().position(|item| matches!(item,
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+            if matches!(&event.item, TurnItem::CommandExecution(command) if command.id == "short")
+    )).ok_or("missing short command")?;
+    let between = history
+        .iter()
+        .position(|item| {
+            normalized(std::slice::from_ref(item)).is_ok_and(|value| {
+                value
+                    .iter()
+                    .any(|item| item.to_string().contains("between commands"))
+            })
+        })
+        .ok_or("missing intervening message")?;
+    let large = history.iter().position(|item| matches!(item,
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+            if matches!(&event.item, TurnItem::CommandExecution(command) if command.id == "large")
+    )).ok_or("missing large command")?;
+    assert!(short < between && between < large);
+    for (command, id) in commands.iter().zip(["short", "large"]) {
+        assert_eq!(command.id, id);
+        assert_eq!(command.command, ["echo", "hello"]);
+        assert_eq!(command.exit_code, Some(7));
+    }
+    assert_eq!(commands[0].aggregated_output.as_deref(), Some("hello\n"));
+    let output = commands[1]
+        .aggregated_output
+        .as_deref()
+        .ok_or("missing large output")?;
+    assert!(output.len() <= 64 * 1024);
+    assert!(output.starts_with("START") && output.ends_with("END"));
+    assert!(output.contains("command output truncated for persistence"));
+    Ok(())
 }
 
 fn message(role: &str, text: &str) -> Result<RolloutItem, serde_json::Error> {

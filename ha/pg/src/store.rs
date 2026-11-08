@@ -8,13 +8,15 @@ use std::sync::MutexGuard;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutItem;
-use codex_rollout::into_persisted_rollout_items;
+use codex_rollout::persisted_rollout_item;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::CreateThreadParams;
@@ -471,7 +473,27 @@ impl PgThreadStore {
         }
         let thread_id = params.thread_id;
         let writer = self.require_live_writer(thread_id)?;
-        let items = into_persisted_rollout_items(params.items, writer.history_mode);
+        let items: Vec<_> = params
+            .items
+            .into_iter()
+            .filter_map(|item| {
+                // Legacy policy omits command completions; retain them in PG using the same
+                // bounded-output projection as paginated history. Preserve the input order.
+                let mode = if matches!(writer.history_mode, ThreadHistoryMode::Legacy)
+                    && matches!(&item, RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+                    if matches!(event.item, TurnItem::CommandExecution(_)))
+                {
+                    ThreadHistoryMode::Paginated
+                } else {
+                    writer.history_mode
+                };
+                match persisted_rollout_item(&item, mode) {
+                    Some(std::borrow::Cow::Borrowed(_)) => Some(item),
+                    Some(std::borrow::Cow::Owned(projected)) => Some(projected),
+                    None => None,
+                }
+            })
+            .collect();
         if items.is_empty() {
             return Ok(());
         }
