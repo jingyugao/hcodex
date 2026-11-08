@@ -1,0 +1,3 @@
+[env]
+# Test threads run codex's large debug-build futures; the default 2 MiB stack overflows.
+RUST_MIN_STACK = "8388608"

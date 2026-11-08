@@ -1,0 +1,33 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "hcodex-pg"
+version.workspace = true
+
+[lib]
+name = "hcodex_pg"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true, features = ["serde"] }
+codex-protocol = { workspace = true }
+codex-rollout = { workspace = true }
+codex-thread-store = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+sqlx-macros = { workspace = true }
+# The workspace enables `sqlx-core/offline` (via sqlx-sqlite); the Postgres driver must match it.
+sqlx-postgres = { version = "=0.9.0", default-features = false, features = ["offline"] }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
